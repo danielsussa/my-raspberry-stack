@@ -1,11 +1,11 @@
 services:
-  ticks-api:
+  mt5-ticker-uploader:
     build:
-      context: ./services/api
-    container_name: ticks-api
+      context: ./services/mt5-ticker-uploader
+    container_name: mt5-ticker-uploader
     restart: unless-stopped
     volumes:
-      - ./.data/uploads:/data/uploads
+      - ./.data/mt5-ticker-uploader:/data/mt5-ticker-uploader
 
   nginx:
     image: nginx:alpine

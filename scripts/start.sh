@@ -17,4 +17,24 @@ fi
 
 # Restart cleanly
 docker compose down
+
+# Rebuild by default (opt-out with --no-build)
+BUILD=true
+for arg in "$@"; do
+  case "$arg" in
+    --no-build)
+      BUILD=false
+      ;;
+    --build)
+      BUILD=true
+      ;;
+    *)
+      ;;
+  esac
+done
+
+if [ "$BUILD" = true ]; then
+  exec docker compose up -d --build
+fi
+
 exec docker compose up -d
