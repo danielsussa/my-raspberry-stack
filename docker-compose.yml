@@ -22,9 +22,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    command: ["http", "${NGROK_TARGET}", "--url=${NGROK_DOMAIN}"]
+    command: ["start", "--all", "--config", "/etc/ngrok/ngrok.yml"]
     ports:
       - "4040:4040"
+    volumes:
+      - ./config/ngrok/ngrok.yml:/etc/ngrok/ngrok.yml:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

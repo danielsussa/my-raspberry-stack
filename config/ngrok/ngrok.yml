@@ -1,0 +1,10 @@
+version: "3"
+tunnels:
+  web:
+    proto: http
+    addr: nginx:80
+    domain: ivanna-unwhispering-histologically.ngrok-free.dev
+  ssh:
+    proto: tcp
+    addr: host.docker.internal:22
+#    remote_addr: 0.tcp.sa.ngrok.io:14546
