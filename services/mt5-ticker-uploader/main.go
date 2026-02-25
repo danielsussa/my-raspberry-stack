@@ -82,15 +82,16 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	symbolDir := filepath.Join(uploadDir, payload.Symbol)
-	if err := os.MkdirAll(symbolDir, 0o755); err != nil {
-		http.Error(w, "could not create upload directory", http.StatusInternalServerError)
-		return
-	}
-
 	timestamp := payload.Ticks[0].TimeMSC
 	if timestamp <= 0 {
 		timestamp = time.Now().UTC().UnixMilli()
+	}
+
+	dateDir := time.UnixMilli(timestamp).UTC().Format("2006-01-02")
+	symbolDir := filepath.Join(uploadDir, dateDir, payload.Symbol)
+	if err := os.MkdirAll(symbolDir, 0o755); err != nil {
+		http.Error(w, "could not create upload directory", http.StatusInternalServerError)
+		return
 	}
 
 	outPath := filepath.Join(symbolDir, fmt.Sprintf("%d.csv", timestamp))
