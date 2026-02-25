@@ -30,13 +30,54 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  n8n:
-    image: n8nio/n8n:latest
-    container_name: n8n
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: grafana
     restart: unless-stopped
-    env_file:
-      - .env
-    ports:
-      - "5678:5678"
+    environment:
+      - GF_SERVER_DOMAIN=ivanna-unwhispering-histologically.ngrok-free.dev
+      - GF_SERVER_ROOT_URL=https://ivanna-unwhispering-histologically.ngrok-free.dev/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
     volumes:
-      - ./.data/n8n:/home/node/.n8n
+      - ./.data/grafana:/var/lib/grafana
+
+  # nsqlookupd:
+  #   image: nsqio/nsq:latest
+  #   container_name: nsqlookupd
+  #   restart: unless-stopped
+  #   command: /nsqlookupd
+  #   ports:
+  #     - "4160:4160"
+  #     - "4161:4161"
+
+  # nsqd:
+  #   image: nsqio/nsq:latest
+  #   container_name: nsqd
+  #   restart: unless-stopped
+  #   command: /nsqd --lookupd-tcp-address=nsqlookupd:4160
+  #   depends_on:
+  #     - nsqlookupd
+  #   ports:
+  #     - "4150:4150"
+  #     - "4151:4151"
+
+  # nsqadmin:
+  #   image: nsqio/nsq:latest
+  #   container_name: nsqadmin
+  #   restart: unless-stopped
+  #   command: /nsqadmin --lookupd-http-address=nsqlookupd:4161
+  #   depends_on:
+  #     - nsqlookupd
+  #   ports:
+  #     - "4171:4171"
+
+  # n8n:
+  #   image: n8nio/n8n:latest
+  #   container_name: n8n
+  #   restart: unless-stopped
+  #   env_file:
+  #     - .env
+  #   ports:
+  #     - "5678:5678"
+  #   volumes:
+  #     - ./.data/n8n:/home/node/.n8n
