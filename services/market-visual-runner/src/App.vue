@@ -102,6 +102,7 @@ const chartRefs = new Map();
 const chartInstances = new Map();
 const visibleSymbols = ref([]);
 let renderToken = 0;
+const dragState = { active: false, startIndex: 0, currentIndex: 0, chart: null };
 
 const parseResolutionMinutes = (resolution) => {
   if (typeof resolution !== "string") return 1;
@@ -340,6 +341,26 @@ const renderCharts = async () => {
             ctx.restore();
           },
         },
+        {
+          id: "range-selection",
+          beforeDatasetsDraw(chartInstance) {
+            if (!dragState.active || dragState.chart !== chartInstance) return;
+            const { ctx, chartArea, scales } = chartInstance;
+            if (!chartArea || !scales?.x) return;
+            const { top, bottom } = chartArea;
+            const startIdx = Math.min(dragState.startIndex, dragState.currentIndex);
+            const endIdx = Math.max(dragState.startIndex, dragState.currentIndex);
+            const xStart = scales.x.getPixelForValue(startIdx);
+            const xEnd = scales.x.getPixelForValue(endIdx + 1);
+            ctx.save();
+            ctx.fillStyle = "rgba(123, 230, 207, 0.18)";
+            ctx.strokeStyle = "rgba(123, 230, 207, 0.7)";
+            ctx.lineWidth = 1;
+            ctx.fillRect(xStart, top, xEnd - xStart, bottom - top);
+            ctx.strokeRect(xStart, top, xEnd - xStart, bottom - top);
+            ctx.restore();
+          },
+        },
       ],
       type: "line",
       data: {
@@ -387,6 +408,7 @@ const renderCharts = async () => {
     });
     chartInstances.set(symbol, chart);
     installHoverSync(canvas, chart);
+    installRangeSelection(canvas, chart);
   });
 };
 
@@ -425,6 +447,70 @@ const installHoverSync = (canvas, chart) => {
       otherChart.tooltip?.setActiveElements?.(active, { x: element.x, y: element.y });
       otherChart.update("none");
     });
+  });
+};
+
+const getIndexFromEvent = (chart, event) => {
+  const points = chart.getElementsAtEventForMode(event, "index", { intersect: false }, false);
+  if (points?.length) {
+    return points[0].index;
+  }
+  const scale = chart.scales?.x;
+  if (!scale) return null;
+  const rect = chart.canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const minuteIndex = Math.round(scale.getValueForPixel(x));
+  if (!Number.isFinite(minuteIndex)) return null;
+  const maxMinutes = Math.max((rangeEnd.value - rangeStart.value + 1) * resolutionMinutes.value - 1, 0);
+  return Math.min(Math.max(minuteIndex, 0), maxMinutes);
+};
+
+const finalizeRangeSelection = () => {
+  if (!dragState.active || !dragState.chart) return;
+  const startMinute = Math.min(dragState.startIndex, dragState.currentIndex);
+  const endMinute = Math.max(dragState.startIndex, dragState.currentIndex);
+  const baseMinute = rangeStart.value * resolutionMinutes.value;
+  const startBucket = Math.floor((baseMinute + startMinute) / resolutionMinutes.value);
+  const endBucket = Math.floor((baseMinute + endMinute) / resolutionMinutes.value);
+  dragState.active = false;
+  dragState.chart.update("none");
+  dragState.chart = null;
+  rangeStart.value = startBucket;
+  rangeEnd.value = endBucket;
+  clampRange();
+  if (sliderApi.value) {
+    sliderApi.value.set([rangeStart.value, rangeEnd.value]);
+  }
+  renderCharts();
+};
+
+const installRangeSelection = (canvas, chart) => {
+  if (canvas.__rangeSelectInstalled) return;
+  canvas.__rangeSelectInstalled = true;
+  canvas.addEventListener("mousedown", (event) => {
+    if (event.button !== 0) return;
+    const index = getIndexFromEvent(chart, event);
+    if (index == null) return;
+    dragState.active = true;
+    dragState.startIndex = index;
+    dragState.currentIndex = index;
+    dragState.chart = chart;
+    chart.update("none");
+  });
+  canvas.addEventListener("mousemove", (event) => {
+    if (!dragState.active || dragState.chart !== chart) return;
+    const index = getIndexFromEvent(chart, event);
+    if (index == null) return;
+    dragState.currentIndex = index;
+    chart.update("none");
+  });
+  canvas.addEventListener("mouseup", () => {
+    finalizeRangeSelection();
+  });
+  canvas.addEventListener("mouseleave", () => {
+    if (dragState.active && dragState.chart === chart) {
+      finalizeRangeSelection();
+    }
   });
 };
 
