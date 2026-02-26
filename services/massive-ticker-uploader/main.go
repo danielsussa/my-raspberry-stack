@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -101,6 +102,12 @@ func run(wssURL, apiKey, subscribe string) error {
 
 	log.Printf("subscribe sent: %s", subscribe)
 
+	flushInterval := 1 * time.Minute
+	acc := newTickAccumulator(flushInterval, func(symbol string, entries []massiveTick) error {
+		return writeCSV(symbol, entries)
+	})
+	defer acc.Stop()
+
 	var messageCount int64
 	for {
 		_, data, err := conn.ReadMessage()
@@ -124,9 +131,7 @@ func run(wssURL, apiKey, subscribe string) error {
 				continue
 			}
 
-			if err := persistTicks(ticks); err != nil {
-				log.Printf("persist error: %v", err)
-			}
+			acc.Add(ticks)
 			continue
 		}
 
@@ -142,25 +147,75 @@ func run(wssURL, apiKey, subscribe string) error {
 	}
 }
 
-func persistTicks(ticks []massiveTick) error {
-	bySymbol := make(map[string][]massiveTick)
+type tickAccumulator struct {
+	mu       sync.Mutex
+	bySymbol map[string][]massiveTick
+	ticker   *time.Ticker
+	stopCh   chan struct{}
+	flushFn  func(symbol string, entries []massiveTick) error
+}
+
+func newTickAccumulator(interval time.Duration, flushFn func(symbol string, entries []massiveTick) error) *tickAccumulator {
+	acc := &tickAccumulator{
+		bySymbol: make(map[string][]massiveTick),
+		ticker:   time.NewTicker(interval),
+		stopCh:   make(chan struct{}),
+		flushFn:  flushFn,
+	}
+
+	go acc.loop()
+	return acc
+}
+
+func (a *tickAccumulator) Add(ticks []massiveTick) {
+	if len(ticks) == 0 {
+		return
+	}
+	a.mu.Lock()
 	for _, tick := range ticks {
 		if tick.Sym == "" {
 			continue
 		}
-		bySymbol[tick.Sym] = append(bySymbol[tick.Sym], tick)
+		a.bySymbol[tick.Sym] = append(a.bySymbol[tick.Sym], tick)
 	}
+	a.mu.Unlock()
+}
 
-	for symbol, entries := range bySymbol {
+func (a *tickAccumulator) Stop() {
+	close(a.stopCh)
+	a.ticker.Stop()
+	a.flush()
+}
+
+func (a *tickAccumulator) loop() {
+	for {
+		select {
+		case <-a.ticker.C:
+			a.flush()
+		case <-a.stopCh:
+			return
+		}
+	}
+}
+
+func (a *tickAccumulator) flush() {
+	a.mu.Lock()
+	if len(a.bySymbol) == 0 {
+		a.mu.Unlock()
+		return
+	}
+	pending := a.bySymbol
+	a.bySymbol = make(map[string][]massiveTick)
+	a.mu.Unlock()
+
+	for symbol, entries := range pending {
 		if len(entries) == 0 {
 			continue
 		}
-		if err := writeCSV(symbol, entries); err != nil {
-			return err
+		if err := a.flushFn(symbol, entries); err != nil {
+			log.Printf("persist error: %v", err)
 		}
 	}
-
-	return nil
 }
 
 func writeCSV(symbol string, ticks []massiveTick) error {

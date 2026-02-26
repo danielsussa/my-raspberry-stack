@@ -20,6 +20,20 @@ services:
     volumes:
       - ./.data/massive-ticker-uploader:/data/massive-ticker-uploader
 
+  cedro-ticker-uploader:
+    build:
+      context: ./services/cedro-ticker-uploader
+    container_name: cedro-ticker-uploader
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - CEDRO_HOST=datafeed2.cedrotech.com
+      - CEDRO_PORT=81
+      - CEDRO_COMMAND=${CEDRO_COMMAND:-GQT BOVA11 S}
+    volumes:
+      - ./.data/cedro-ticker-uploader:/data/cedro-ticker-uploader
+
   market-visual-runner:
     build:
       context: ./services/market-visual-runner
