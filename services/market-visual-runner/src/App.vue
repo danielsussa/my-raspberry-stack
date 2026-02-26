@@ -103,14 +103,26 @@ const chartInstances = new Map();
 const visibleSymbols = ref([]);
 let renderToken = 0;
 
+const parseResolutionMinutes = (resolution) => {
+  if (typeof resolution !== "string") return 1;
+  const trimmed = resolution.trim().toLowerCase();
+  const match = trimmed.match(/^(\d+)\s*([mh])$/);
+  if (!match) return 1;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return 1;
+  return match[2] === "h" ? amount * 60 : amount;
+};
+
+const resolutionMinutes = computed(() => parseResolutionMinutes(timeframe.value?.resolution));
+
 const minutesCount = computed(() => {
-  const first = timeframe.value?.quality_per_symbol?.[0];
-  if (!first?.frame_quality_per_minute) return 0;
-  return first.frame_quality_per_minute.length;
+  const first = timeframe.value?.frame_quality?.[0];
+  if (!first?.quality) return 0;
+  return first.quality.length;
 });
 
 const symbols = computed(() => {
-  const list = timeframe.value?.quality_per_symbol ?? [];
+  const list = timeframe.value?.frame_quality ?? [];
   return list.map((entry) => entry.symbol);
 });
 
@@ -131,7 +143,7 @@ const startMinuteLabel = computed(() => {
   if (!timeframe.value?.start || !minutesCount.value) return "";
   const base = new Date(timeframe.value.start);
   if (Number.isNaN(base.getTime())) return "";
-  const current = new Date(base.getTime() + rangeStart.value * 60_000);
+  const current = new Date(base.getTime() + rangeStart.value * resolutionMinutes.value * 60_000);
   return formatDateTime(current);
 });
 
@@ -139,7 +151,7 @@ const endMinuteLabel = computed(() => {
   if (!timeframe.value?.start || !minutesCount.value) return "";
   const base = new Date(timeframe.value.start);
   if (Number.isNaN(base.getTime())) return "";
-  const current = new Date(base.getTime() + rangeEnd.value * 60_000);
+  const current = new Date(base.getTime() + (rangeEnd.value + 1) * resolutionMinutes.value * 60_000 - 60_000);
   return formatDateTime(current);
 });
 
@@ -244,10 +256,10 @@ const renderCharts = async () => {
   if (!timeframe.value?.start) return;
   const base = new Date(timeframe.value.start);
   if (Number.isNaN(base.getTime())) return;
-  const startTime = new Date(base.getTime() + rangeStart.value * 60_000);
-  const endTime = new Date(base.getTime() + rangeEnd.value * 60_000);
+  const startTime = new Date(base.getTime() + rangeStart.value * resolutionMinutes.value * 60_000);
+  const endTime = new Date(base.getTime() + (rangeEnd.value + 1) * resolutionMinutes.value * 60_000 - 60_000);
   const qualityMap = new Map(
-    (timeframe.value?.quality_per_symbol ?? []).map((entry) => [entry.symbol, entry.frame_quality_per_minute])
+    (timeframe.value?.frame_quality ?? []).map((entry) => [entry.symbol, entry.quality])
   );
   const token = (renderToken += 1);
 
@@ -285,7 +297,7 @@ const renderCharts = async () => {
     const flags = qualityMap.get(symbol) ?? [];
     const data = result?.prices ?? [];
     const labels = result?.datetimes ?? [];
-    const gaps = buildGapRanges(flags, rangeStart.value, rangeEnd.value);
+    const gaps = buildGapRanges(flags, rangeStart.value, rangeEnd.value, resolutionMinutes.value);
     const chart = new Chart(canvas, {
       plugins: [
         {
@@ -365,7 +377,7 @@ const fetchPriceOverview = async (symbol, start, end) => {
   return response.json();
 };
 
-const buildGapRanges = (flags, startIdx, endIdx) => {
+const buildGapRanges = (flags, startIdx, endIdx, stepMinutes) => {
   const ranges = [];
   let inGap = false;
   let gapStart = startIdx;
@@ -383,7 +395,16 @@ const buildGapRanges = (flags, startIdx, endIdx) => {
   if (inGap) {
     ranges.push([gapStart - startIdx, endIdx - startIdx]);
   }
-  return ranges;
+  if (stepMinutes <= 1) return ranges;
+  const expanded = [];
+  const maxOffset = (endIdx - startIdx + 1) * stepMinutes - 1;
+  ranges.forEach(([startBucket, endBucket]) => {
+    const startMinute = startBucket * stepMinutes;
+    let endMinute = (endBucket + 1) * stepMinutes - 1;
+    if (endMinute > maxOffset) endMinute = maxOffset;
+    expanded.push([startMinute, endMinute]);
+  });
+  return expanded;
 };
 
 </script>

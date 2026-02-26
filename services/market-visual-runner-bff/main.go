@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -26,12 +27,13 @@ type statusResponse struct {
 type timeframeResponse struct {
 	Start            string                 `json:"start"`
 	End              string                 `json:"end"`
-	QualityPerSymbol []symbolFrameQuality   `json:"quality_per_symbol"`
+	Resolution       string                 `json:"resolution"`
+	FrameQuality     []symbolFrameQuality   `json:"frame_quality"`
 }
 
 type symbolFrameQuality struct {
 	Symbol                string `json:"symbol"`
-	FrameQualityPerMinute []int  `json:"frame_quality_per_minute"`
+	Quality               []int  `json:"quality"`
 }
 
 type priceOverviewResponse struct {
@@ -59,12 +61,12 @@ func main() {
 	port := envOrDefault("PORT", "8080")
 	version := envOrDefault("APP_VERSION", "dev")
 	allowedOrigins := parseOrigins(envOrDefault("BFF_ALLOWED_ORIGINS", "*"))
-	dataDir := envOrDefault("MT5_DATA_DIR", "/data/mt5-ticker-uploader")
+	dataDirs := parseDirs(envOrDefault("DATA_DIRS", "/data/cedro-ticker-uploader,/data/massive-ticker-uploader"))
 	cacheTTL := time.Minute
 	cache := &timeframeCache{}
 	store := newDataStore()
 
-	if err := store.loadFromDir(dataDir); err != nil {
+	if err := store.loadFromDirs(dataDirs); err != nil {
 		log.Printf("failed to preload data: %v", err)
 	}
 
@@ -219,6 +221,19 @@ func parseOrigins(value string) []string {
 	return origins
 }
 
+func parseDirs(value string) []string {
+	parts := strings.Split(value, ",")
+	dirs := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		dirs = append(dirs, trimmed)
+	}
+	return dirs
+}
+
 func envOrDefault(key, fallback string) string {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
@@ -342,12 +357,38 @@ func newDataStore() *dataStore {
 	}
 }
 
-func (s *dataStore) loadFromDir(rootDir string) error {
+func (s *dataStore) loadFromDirs(rootDirs []string) error {
 	startTS := int64(0)
 	endTS := int64(0)
 	quality := make(map[string]map[int64]bool)
 	prices := make(map[string]map[int64]minutePrice)
 
+	for _, rootDir := range rootDirs {
+		if strings.TrimSpace(rootDir) == "" {
+			continue
+		}
+		if _, err := os.Stat(rootDir); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if err := loadFromDir(rootDir, quality, prices, &startTS, &endTS); err != nil {
+			return err
+		}
+	}
+
+	s.mu.Lock()
+	s.startTS = startTS
+	s.endTS = endTS
+	s.qualityBySymbol = quality
+	s.priceBySymbol = prices
+	s.mu.Unlock()
+
+	return nil
+}
+
+func loadFromDir(rootDir string, quality map[string]map[int64]bool, prices map[string]map[int64]minutePrice, startTS, endTS *int64) error {
 	dateDirs, err := os.ReadDir(rootDir)
 	if err != nil {
 		return err
@@ -357,7 +398,8 @@ func (s *dataStore) loadFromDir(rootDir string) error {
 		if !dateEntry.IsDir() {
 			continue
 		}
-		datePath := filepath.Join(rootDir, dateEntry.Name())
+		dateName := dateEntry.Name()
+		datePath := filepath.Join(rootDir, dateName)
 		symbolDirs, err := os.ReadDir(datePath)
 		if err != nil {
 			return err
@@ -380,22 +422,65 @@ func (s *dataStore) loadFromDir(rootDir string) error {
 				if !strings.HasSuffix(name, ".csv") {
 					continue
 				}
+				updateRangeFromPath(dateName, name, startTS, endTS)
 				path := filepath.Join(symbolPath, name)
-				if err := ingestCSV(path, quality, prices, &startTS, &endTS); err != nil {
+				if err := ingestFile(path, quality, prices, startTS, endTS); err != nil {
 					return err
 				}
 			}
 		}
 	}
 
-	s.mu.Lock()
-	s.startTS = startTS
-	s.endTS = endTS
-	s.qualityBySymbol = quality
-	s.priceBySymbol = prices
-	s.mu.Unlock()
-
 	return nil
+}
+
+func updateRangeFromPath(dateName, fileName string, minTS, maxTS *int64) {
+	ts, ok := parseDirFileTimestamp(dateName, fileName)
+	if !ok {
+		return
+	}
+	if *minTS == 0 || ts < *minTS {
+		*minTS = ts
+	}
+	if *maxTS == 0 || ts > *maxTS {
+		*maxTS = ts
+	}
+}
+
+func parseDirFileTimestamp(dateName, fileName string) (int64, bool) {
+	dateParts := strings.Split(dateName, "-")
+	if len(dateParts) != 3 {
+		return 0, false
+	}
+	year, err := strconv.Atoi(dateParts[0])
+	if err != nil {
+		return 0, false
+	}
+	month, err := strconv.Atoi(dateParts[1])
+	if err != nil || month < 1 || month > 12 {
+		return 0, false
+	}
+	day, err := strconv.Atoi(dateParts[2])
+	if err != nil || day < 1 || day > 31 {
+		return 0, false
+	}
+
+	baseName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	timeParts := strings.Split(baseName, "_")
+	if len(timeParts) != 2 {
+		return 0, false
+	}
+	hour, err := strconv.Atoi(timeParts[0])
+	if err != nil || hour < 0 || hour > 23 {
+		return 0, false
+	}
+	minute, err := strconv.Atoi(timeParts[1])
+	if err != nil || minute < 0 || minute > 59 {
+		return 0, false
+	}
+
+	t := time.Date(year, time.Month(month), day, hour, minute, 0, 0, time.UTC)
+	return t.UnixMilli(), true
 }
 
 func (s *dataStore) buildTimeframeResponse() (timeframeResponse, error) {
@@ -407,7 +492,8 @@ func (s *dataStore) buildTimeframeResponse() (timeframeResponse, error) {
 		return timeframeResponse{
 			Start:            now.Format(time.RFC3339),
 			End:              now.Format(time.RFC3339),
-			QualityPerSymbol: []symbolFrameQuality{},
+			Resolution:       "1m",
+			FrameQuality:     []symbolFrameQuality{},
 		}, nil
 	}
 
@@ -415,10 +501,27 @@ func (s *dataStore) buildTimeframeResponse() (timeframeResponse, error) {
 	endTime := time.UnixMilli(s.endTS).UTC()
 	startMinute := startTime.Truncate(time.Minute)
 	endMinute := endTime.Truncate(time.Minute)
-	minuteCount := int(endMinute.Sub(startMinute).Minutes()) + 1
-	if minuteCount < 1 {
-		minuteCount = 1
+	totalMinutes := int(endMinute.Sub(startMinute).Minutes())
+	if totalMinutes < 0 {
+		totalMinutes = 0
 	}
+	resolutionMinutes := 1
+	resolutionLabel := "1m"
+	switch {
+	case totalMinutes > 7*24*60:
+		resolutionMinutes = 12 * 60
+		resolutionLabel = "12h"
+	case totalMinutes > 24*60:
+		resolutionMinutes = 60
+		resolutionLabel = "1h"
+	case totalMinutes > 6*60:
+		resolutionMinutes = 10
+		resolutionLabel = "10m"
+	case totalMinutes > 2*60:
+		resolutionMinutes = 5
+		resolutionLabel = "5m"
+	}
+	bucketCount := totalMinutes/resolutionMinutes + 1
 
 	symbols := make([]string, 0, len(s.qualityBySymbol))
 	qualityCounts := make(map[string]int, len(s.qualityBySymbol))
@@ -437,24 +540,25 @@ func (s *dataStore) buildTimeframeResponse() (timeframeResponse, error) {
 
 	quality := make([]symbolFrameQuality, 0, len(symbols))
 	for _, symbol := range symbols {
-		flags := make([]int, minuteCount)
+		flags := make([]int, bucketCount)
 		for minute := range s.qualityBySymbol[symbol] {
 			tsTime := time.Unix(minute, 0).UTC().Truncate(time.Minute)
-			index := int(tsTime.Sub(startMinute).Minutes())
-			if index >= 0 && index < minuteCount {
+			index := int(tsTime.Sub(startMinute).Minutes()) / resolutionMinutes
+			if index >= 0 && index < bucketCount {
 				flags[index] = 1
 			}
 		}
 		quality = append(quality, symbolFrameQuality{
-			Symbol:                symbol,
-			FrameQualityPerMinute: flags,
+			Symbol:  symbol,
+			Quality: flags,
 		})
 	}
 
 	return timeframeResponse{
 		Start:            startTime.Format(time.RFC3339),
 		End:              endTime.Format(time.RFC3339),
-		QualityPerSymbol: quality,
+		Resolution:       resolutionLabel,
+		FrameQuality:     quality,
 	}, nil
 }
 
@@ -502,28 +606,69 @@ func (s *dataStore) buildPriceOverview(symbol string, start, end time.Time) (pri
 	}, true, nil
 }
 
-func ingestCSV(path string, quality map[string]map[int64]bool, prices map[string]map[int64]minutePrice, minTS, maxTS *int64) error {
+func ingestFile(path string, quality map[string]map[int64]bool, prices map[string]map[int64]minutePrice, minTS, maxTS *int64) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	reader := csv.NewReader(file)
-	reader.FieldsPerRecord = -1
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		return scanner.Err()
+	}
+	firstLine := strings.TrimSpace(scanner.Text())
+	if firstLine == "" {
+		return nil
+	}
 
-	headers, err := reader.Read()
+	if strings.Contains(firstLine, "|") && !strings.Contains(firstLine, ",") {
+		if err := ingestCedroLine(firstLine, path, quality, prices, minTS, maxTS); err != nil {
+			return err
+		}
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			if err := ingestCedroLine(line, path, quality, prices, minTS, maxTS); err != nil {
+				return err
+			}
+		}
+		return scanner.Err()
+	}
+
+	headers, err := parseCSVHeader(firstLine)
 	if err != nil {
 		return err
 	}
+	reader := csv.NewReader(file)
+	reader.FieldsPerRecord = -1
+	return ingestCSVWithHeaders(reader, headers, path, quality, prices, minTS, maxTS)
+}
 
+func parseCSVHeader(line string) ([]string, error) {
+	reader := csv.NewReader(strings.NewReader(line))
+	reader.FieldsPerRecord = -1
+	headers, err := reader.Read()
+	if err != nil {
+		return nil, err
+	}
+	return headers, nil
+}
+
+func ingestCSVWithHeaders(reader *csv.Reader, headers []string, path string, quality map[string]map[int64]bool, prices map[string]map[int64]minutePrice, minTS, maxTS *int64) error {
 	idxTime := indexOf(headers, "time_msc")
 	if idxTime == -1 {
-		return errors.New("missing time_msc column")
+		idxTime = indexOf(headers, "t")
+	}
+	if idxTime == -1 {
+		return errors.New("missing time column")
 	}
 	idxLast := indexOf(headers, "last")
 	idxBid := indexOf(headers, "bid")
 	idxAsk := indexOf(headers, "ask")
+	idxPrice := indexOf(headers, "p")
 
 	for {
 		record, err := reader.Read()
@@ -539,38 +684,74 @@ func ingestCSV(path string, quality map[string]map[int64]bool, prices map[string
 		if idxTime >= len(record) {
 			continue
 		}
-		ts, err := strconv.ParseInt(strings.TrimSpace(record[idxTime]), 10, 64)
-		if err != nil {
-			continue
-		}
-		price, ok := parsePrice(record, idxLast, idxBid, idxAsk)
+		ts, ok := parseTimestamp(record[idxTime])
 		if !ok {
 			continue
 		}
-		minute := time.UnixMilli(ts).UTC().Truncate(time.Minute)
-		key := minute.Unix()
-
-		symbol := filepath.Base(filepath.Dir(path))
-		if quality[symbol] == nil {
-			quality[symbol] = make(map[int64]bool)
+		price, ok := parsePrice(record, idxLast, idxBid, idxAsk)
+		if !ok && idxPrice >= 0 && idxPrice < len(record) {
+			price, ok = parseFloat(record[idxPrice])
 		}
-		quality[symbol][key] = true
-
-		if prices[symbol] == nil {
-			prices[symbol] = make(map[int64]minutePrice)
+		if !ok {
+			continue
 		}
-		current, exists := prices[symbol][key]
-		if !exists || ts > current.ts {
-			prices[symbol][key] = minutePrice{ts: ts, price: price}
-		}
-
-		if *minTS == 0 || ts < *minTS {
-			*minTS = ts
-		}
-		if *maxTS == 0 || ts > *maxTS {
-			*maxTS = ts
-		}
+		applyPoint(path, ts, price, quality, prices, minTS, maxTS)
 	}
+}
+
+func ingestCedroLine(line, path string, quality map[string]map[int64]bool, prices map[string]map[int64]minutePrice, minTS, maxTS *int64) error {
+	parts := strings.Split(line, "|")
+	if len(parts) < 2 {
+		return nil
+	}
+	ts, ok := parseTimestamp(parts[0])
+	if !ok {
+		return nil
+	}
+	fields := strings.Split(parts[1], ":")
+	if len(fields) < 5 {
+		return nil
+	}
+	price, ok := parseFloat(fields[4])
+	if !ok {
+		return nil
+	}
+	applyPoint(path, ts, price, quality, prices, minTS, maxTS)
+	return nil
+}
+
+func applyPoint(path string, ts int64, price float64, quality map[string]map[int64]bool, prices map[string]map[int64]minutePrice, minTS, maxTS *int64) {
+	minute := time.UnixMilli(ts).UTC().Truncate(time.Minute)
+	key := minute.Unix()
+
+	symbol := filepath.Base(filepath.Dir(path))
+	if quality[symbol] == nil {
+		quality[symbol] = make(map[int64]bool)
+	}
+	quality[symbol][key] = true
+
+	if prices[symbol] == nil {
+		prices[symbol] = make(map[int64]minutePrice)
+	}
+	current, exists := prices[symbol][key]
+	if !exists || ts > current.ts {
+		prices[symbol][key] = minutePrice{ts: ts, price: price}
+	}
+}
+
+func parseTimestamp(value string) (int64, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0, false
+	}
+	ts, err := strconv.ParseInt(trimmed, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if ts < 10_000_000_000 {
+		ts *= 1000
+	}
+	return ts, true
 }
 
 func (c *timeframeCache) getOrBuild(ttl time.Duration, build func() (timeframeResponse, error)) (timeframeResponse, error) {
