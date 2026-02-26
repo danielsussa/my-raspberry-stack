@@ -41,6 +41,8 @@ services:
       context: ./services/market-visual-runner-bff
     container_name: market-visual-runner-bff
     restart: unless-stopped
+    volumes:
+      - ./.data/mt5-ticker-uploader:/data/mt5-ticker-uploader:ro
 
   nginx:
     image: nginx:alpine
