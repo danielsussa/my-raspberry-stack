@@ -58,7 +58,7 @@
     <section class="panel">
       <div class="panel-title">Price Charts</div>
       <div class="charts-grid">
-        <div v-for="symbol in symbols" :key="symbol" class="chart-card">
+        <div v-for="symbol in visibleSymbols" :key="symbol" class="chart-card">
           <div class="chart-header">
             <div class="label">Symbol</div>
             <div class="value">{{ symbol }}</div>
@@ -67,7 +67,7 @@
             <canvas :ref="setChartRef(symbol)"></canvas>
           </div>
         </div>
-        <div v-if="!symbols.length" class="chart-empty">
+        <div v-if="!visibleSymbols.length" class="chart-empty">
           <div class="value">Sem ativos.</div>
         </div>
       </div>
@@ -85,7 +85,7 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import Chart from "chart.js/auto";
 import noUiSlider from "nouislider";
 import "nouislider/dist/nouislider.css";
@@ -100,6 +100,7 @@ const sliderEl = ref(null);
 const sliderApi = ref(null);
 const chartRefs = new Map();
 const chartInstances = new Map();
+const visibleSymbols = ref([]);
 let renderToken = 0;
 
 const minutesCount = computed(() => {
@@ -168,9 +169,6 @@ onMounted(fetchTimeframe);
 
 watch(rangeStart, clampRange);
 watch(rangeEnd, clampRange);
-watch([rangeStart, rangeEnd], () => {
-  renderCharts();
-});
 
 const initOrUpdateSlider = () => {
   if (!sliderEl.value || !minutesCount.value) return;
@@ -189,6 +187,9 @@ const initOrUpdateSlider = () => {
       const endVal = Math.round(Number(values[1]));
       if (rangeStart.value !== startVal) rangeStart.value = startVal;
       if (rangeEnd.value !== endVal) rangeEnd.value = endVal;
+    });
+    sliderApi.value.on("change", () => {
+      renderCharts();
     });
   } else {
     sliderApi.value.updateOptions(
@@ -250,16 +251,31 @@ const renderCharts = async () => {
   );
   const token = (renderToken += 1);
 
-  const payloads = await Promise.all(
-    symbols.value.map(async (symbol) => {
-      const result = await fetchPriceOverview(symbol, startTime, endTime);
-      return { symbol, result };
-    })
-  );
+  let payloads = [];
+  try {
+    payloads = await Promise.all(
+      symbols.value.map(async (symbol) => {
+        const result = await fetchPriceOverview(symbol, startTime, endTime);
+        return { symbol, result };
+      })
+    );
+  } catch (err) {
+    error.value = err?.message ?? "Erro ao carregar price overview.";
+    return;
+  }
 
   if (token !== renderToken) return;
 
+  const availableSymbols = payloads
+    .filter(({ result }) => result?.prices?.length)
+    .map(({ symbol }) => symbol);
+  visibleSymbols.value = availableSymbols;
+  await nextTick();
+
   payloads.forEach(({ symbol, result }) => {
+    if (!result || !result.prices?.length) {
+      return;
+    }
     const canvas = chartRefs.get(symbol);
     if (!canvas) return;
     if (chartInstances.has(symbol)) {
@@ -340,8 +356,11 @@ const fetchPriceOverview = async (symbol, start, end) => {
     end: formatDateTime(end),
   });
   const response = await fetch(`/market-visual-runner-bff/symbols/${encodeURIComponent(symbol)}/price-overview?${params}`);
-  if (!response.ok) {
+  if (response.status === 404) {
     return null;
+  }
+  if (!response.ok) {
+    throw new Error("Falha ao carregar price overview.");
   }
   return response.json();
 };
@@ -438,7 +457,7 @@ const buildGapRanges = (flags, startIdx, endIdx) => {
 
 .charts-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: 1fr;
   gap: 1.2rem;
 }
 

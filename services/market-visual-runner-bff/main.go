@@ -136,9 +136,13 @@ func main() {
 			return
 		}
 
-		resp, err := store.buildPriceOverview(symbol, start, end)
+		resp, ok, err := store.buildPriceOverview(symbol, start, end)
 		if err != nil {
 			http.Error(w, "could not build price overview", http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "no data for symbol", http.StatusNotFound)
 			return
 		}
 		writeJSON(w, http.StatusOK, resp)
@@ -417,10 +421,19 @@ func (s *dataStore) buildTimeframeResponse() (timeframeResponse, error) {
 	}
 
 	symbols := make([]string, 0, len(s.qualityBySymbol))
-	for symbol := range s.qualityBySymbol {
+	qualityCounts := make(map[string]int, len(s.qualityBySymbol))
+	for symbol, minutes := range s.qualityBySymbol {
 		symbols = append(symbols, symbol)
+		qualityCounts[symbol] = len(minutes)
 	}
-	sort.Strings(symbols)
+	sort.Slice(symbols, func(i, j int) bool {
+		ci := qualityCounts[symbols[i]]
+		cj := qualityCounts[symbols[j]]
+		if ci == cj {
+			return symbols[i] < symbols[j]
+		}
+		return ci > cj
+	})
 
 	quality := make([]symbolFrameQuality, 0, len(symbols))
 	for _, symbol := range symbols {
@@ -445,7 +458,7 @@ func (s *dataStore) buildTimeframeResponse() (timeframeResponse, error) {
 	}, nil
 }
 
-func (s *dataStore) buildPriceOverview(symbol string, start, end time.Time) (priceOverviewResponse, error) {
+func (s *dataStore) buildPriceOverview(symbol string, start, end time.Time) (priceOverviewResponse, bool, error) {
 	start = start.UTC().Truncate(time.Minute)
 	end = end.UTC().Truncate(time.Minute)
 	minutes := int(end.Sub(start).Minutes()) + 1
@@ -459,7 +472,11 @@ func (s *dataStore) buildPriceOverview(symbol string, start, end time.Time) (pri
 	s.mu.RLock()
 	points := s.priceBySymbol[symbol]
 	s.mu.RUnlock()
+	if len(points) == 0 {
+		return priceOverviewResponse{}, false, nil
+	}
 
+	hasAny := false
 	for i := 0; i < minutes; i++ {
 		t := start.Add(time.Duration(i) * time.Minute)
 		datetimes = append(datetimes, formatDateTime(t))
@@ -471,13 +488,18 @@ func (s *dataStore) buildPriceOverview(symbol string, start, end time.Time) (pri
 		}
 		value := point.price
 		prices = append(prices, &value)
+		hasAny = true
+	}
+
+	if !hasAny {
+		return priceOverviewResponse{}, false, nil
 	}
 
 	return priceOverviewResponse{
 		Resolution: "1min",
 		Prices:     prices,
 		Datetimes:  datetimes,
-	}, nil
+	}, true, nil
 }
 
 func ingestCSV(path string, quality map[string]map[int64]bool, prices map[string]map[int64]minutePrice, minTS, maxTS *int64) error {
