@@ -7,6 +7,19 @@ services:
     volumes:
       - ./.data/mt5-ticker-uploader:/data/mt5-ticker-uploader
 
+  massive-ticker-uploader:
+    build:
+      context: ./services/massive-ticker-uploader
+    container_name: massive-ticker-uploader
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - MASSIVE_WSS_URL=wss://delayed.massive.com/stocks
+      - MASSIVE_SUBSCRIBE=${MASSIVE_SUBSCRIBE:-T.EWZ}
+    volumes:
+      - ./.data/massive-ticker-uploader:/data/massive-ticker-uploader
+
   nginx:
     image: nginx:alpine
     container_name: nginx
