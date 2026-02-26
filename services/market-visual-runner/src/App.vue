@@ -317,6 +317,29 @@ const renderCharts = async () => {
             ctx.restore();
           },
         },
+        {
+          id: "hover-line",
+          afterDatasetsDraw(chartInstance) {
+            const { ctx, chartArea } = chartInstance;
+            if (!chartArea) return;
+            const active = chartInstance.getActiveElements
+              ? chartInstance.getActiveElements()
+              : chartInstance.tooltip?.getActiveElements?.() ?? [];
+            if (!active.length) return;
+            const { left, right, top, bottom } = chartArea;
+            const x = active[0].element.x;
+            if (x < left || x > right) return;
+            ctx.save();
+            ctx.strokeStyle = "rgba(123, 230, 207, 0.6)";
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 4]);
+            ctx.beginPath();
+            ctx.moveTo(x, top);
+            ctx.lineTo(x, bottom);
+            ctx.stroke();
+            ctx.restore();
+          },
+        },
       ],
       type: "line",
       data: {
@@ -346,6 +369,10 @@ const renderCharts = async () => {
             },
           },
         },
+        interaction: {
+          mode: "index",
+          intersect: false,
+        },
         scales: {
           x: {
             ticks: { color: "#9ad7cf", maxTicksLimit: 5 },
@@ -359,6 +386,45 @@ const renderCharts = async () => {
       },
     });
     chartInstances.set(symbol, chart);
+    installHoverSync(canvas, chart);
+  });
+};
+
+const clearHoverSync = () => {
+  chartInstances.forEach((chart) => {
+    chart.setActiveElements([]);
+    chart.tooltip?.setActiveElements?.([], { x: 0, y: 0 });
+    chart.update("none");
+  });
+};
+
+const installHoverSync = (canvas, chart) => {
+  if (canvas.__hoverSyncInstalled) return;
+  canvas.__hoverSyncInstalled = true;
+  canvas.addEventListener("mouseleave", () => {
+    clearHoverSync();
+  });
+  canvas.addEventListener("mousemove", (event) => {
+    const points = chart.getElementsAtEventForMode(event, "index", { intersect: false }, false);
+    if (!points.length) {
+      clearHoverSync();
+      return;
+    }
+    const dataIndex = points[0].index;
+    chartInstances.forEach((otherChart) => {
+      const meta = otherChart.getDatasetMeta(0);
+      const element = meta?.data?.[dataIndex];
+      if (!element) {
+        otherChart.setActiveElements([]);
+        otherChart.tooltip?.setActiveElements?.([], { x: 0, y: 0 });
+        otherChart.update("none");
+        return;
+      }
+      const active = [{ datasetIndex: 0, index: dataIndex }];
+      otherChart.setActiveElements(active);
+      otherChart.tooltip?.setActiveElements?.(active, { x: element.x, y: element.y });
+      otherChart.update("none");
+    });
   });
 };
 
