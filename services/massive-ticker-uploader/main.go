@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -219,51 +220,95 @@ func (a *tickAccumulator) flush() {
 }
 
 func writeCSV(symbol string, ticks []massiveTick) error {
-	timestamp := ticks[0].T
-	if timestamp <= 0 {
-		timestamp = time.Now().UTC().UnixMilli()
+	type bucket struct {
+		dateDir string
+		minute  string
 	}
 
-	dateDir := time.UnixMilli(timestamp).UTC().Format("2006-01-02")
-	symbolDir := filepath.Join(uploadDir, dateDir, symbol)
-	if err := os.MkdirAll(symbolDir, 0o755); err != nil {
-		return err
-	}
-
-	outPath := filepath.Join(symbolDir, fmt.Sprintf("%d.csv", timestamp))
-	outFile, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer outFile.Close()
-
-	writer := csv.NewWriter(outFile)
-	if err := writer.Write([]string{"ev", "sym", "i", "x", "p", "s", "c", "t", "q", "z", "ds"}); err != nil {
-		return err
-	}
+	groups := make(map[bucket][]massiveTick)
+	order := make([]bucket, 0, 8)
 
 	for _, tick := range ticks {
-		row := []string{
-			tick.Ev,
-			tick.Sym,
-			tick.I,
-			fmt.Sprintf("%d", tick.X),
-			fmt.Sprintf("%g", tick.P),
-			fmt.Sprintf("%d", tick.S),
-			joinInts(tick.C),
-			fmt.Sprintf("%d", tick.T),
-			fmt.Sprintf("%d", tick.Q),
-			fmt.Sprintf("%d", tick.Z),
-			tick.DS,
+		ts := tick.T
+		if ts <= 0 {
+			ts = time.Now().UTC().UnixMilli()
 		}
-		if err := writer.Write(row); err != nil {
-			return err
+		tm := time.UnixMilli(ts).UTC()
+		key := bucket{
+			dateDir: tm.Format("2006-01-02"),
+			minute:  tm.Format("15_04"),
 		}
+		if _, ok := groups[key]; !ok {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], tick)
 	}
 
-	writer.Flush()
-	if err := writer.Error(); err != nil {
-		return err
+	for _, key := range order {
+		symbolDir := filepath.Join(uploadDir, key.dateDir, symbol)
+		if err := os.MkdirAll(symbolDir, 0o755); err != nil {
+			return err
+		}
+
+		entries := groups[key]
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].T < entries[j].T
+		})
+
+		outPath := filepath.Join(symbolDir, fmt.Sprintf("%s.csv", key.minute))
+		needHeader := false
+		if info, err := os.Stat(outPath); err != nil {
+			if os.IsNotExist(err) {
+				needHeader = true
+			} else {
+				return err
+			}
+		} else if info.Size() == 0 {
+			needHeader = true
+		}
+
+		outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return err
+		}
+
+		writer := csv.NewWriter(outFile)
+		if needHeader {
+			if err := writer.Write([]string{"ev", "sym", "i", "x", "p", "s", "c", "t", "q", "z", "ds"}); err != nil {
+				_ = outFile.Close()
+				return err
+			}
+		}
+
+		for _, tick := range entries {
+			row := []string{
+				tick.Ev,
+				tick.Sym,
+				tick.I,
+				fmt.Sprintf("%d", tick.X),
+				fmt.Sprintf("%g", tick.P),
+				fmt.Sprintf("%d", tick.S),
+				joinInts(tick.C),
+				fmt.Sprintf("%d", tick.T),
+				fmt.Sprintf("%d", tick.Q),
+				fmt.Sprintf("%d", tick.Z),
+				tick.DS,
+			}
+			if err := writer.Write(row); err != nil {
+				_ = outFile.Close()
+				return err
+			}
+		}
+
+		writer.Flush()
+		if err := writer.Error(); err != nil {
+			_ = outFile.Close()
+			return err
+		}
+
+		if err := outFile.Close(); err != nil {
+			return err
+		}
 	}
 
 	return nil

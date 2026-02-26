@@ -1,11 +1,11 @@
 services:
-  mt5-ticker-uploader:
-    build:
-      context: ./services/mt5-ticker-uploader
-    container_name: mt5-ticker-uploader
-    restart: unless-stopped
-    volumes:
-      - ./.data/mt5-ticker-uploader:/data/mt5-ticker-uploader
+  # mt5-ticker-uploader:
+  #   build:
+  #     context: ./services/mt5-ticker-uploader
+  #   container_name: mt5-ticker-uploader
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./.data/mt5-ticker-uploader:/data/mt5-ticker-uploader
 
   massive-ticker-uploader:
     build:
