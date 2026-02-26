@@ -2,22 +2,23 @@ package main
 
 import (
 	"bufio"
-	"encoding/csv"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
-const uploadDir = "/data/cedro-ticker-uploader"
+const defaultUploadDir = "/data/cedro-ticker-uploader"
 
 type cedroTick struct {
 	TimeMSC int64
+	Symbol  string
 	Raw     string
 }
 
@@ -42,17 +43,25 @@ func main() {
 		log.Fatal("CEDRO_PASSWORD is required")
 	}
 
-	command := strings.TrimSpace(os.Getenv("CEDRO_COMMAND"))
-	if command == "" {
-		command = "GQT BOVA11 S"
+	commandList := strings.TrimSpace(os.Getenv("CEDRO_COMMANDS"))
+	if commandList == "" {
+		commandList = strings.TrimSpace(os.Getenv("CEDRO_COMMAND"))
+	}
+	if commandList == "" {
+		commandList = "GQT BOVA11 S"
+	}
+
+	uploadDir := strings.TrimSpace(os.Getenv("CEDRO_DATA_DIR"))
+	if uploadDir == "" {
+		uploadDir = defaultUploadDir
 	}
 
 	address := net.JoinHostPort(host, port)
-	log.Printf("starting cedro-ticker-uploader address=%s command=%q", address, command)
+	log.Printf("starting cedro-ticker-uploader address=%s commands=%q data_dir=%s", address, commandList, uploadDir)
 
 	backoff := 2 * time.Second
 	for {
-		if err := run(address, username, password, command); err != nil {
+		if err := run(address, username, password, commandList, uploadDir); err != nil {
 			log.Printf("tcp error: %v", err)
 		}
 
@@ -63,7 +72,7 @@ func main() {
 	}
 }
 
-func run(address, username, password, command string) error {
+func run(address, username, password, commandList, uploadDir string) error {
 	conn, err := net.DialTimeout("tcp", address, 10*time.Second)
 	if err != nil {
 		return err
@@ -79,15 +88,17 @@ func run(address, username, password, command string) error {
 		return err
 	}
 
-	if err := writer.WriteLine(command); err != nil {
-		return err
+	commands := splitCommands(commandList)
+	for _, command := range commands {
+		if err := writer.WriteLine(command); err != nil {
+			return err
+		}
+		log.Printf("command sent: %s", command)
 	}
-
-	log.Printf("command sent: %s", command)
 
 	flushInterval := 1 * time.Minute
 	acc := newTickAccumulator(flushInterval, func(symbol string, entries []cedroTick) error {
-		return writeCSV(symbol, entries)
+		return writeCSV(uploadDir, symbol, entries)
 	})
 	defer acc.Stop()
 
@@ -102,13 +113,19 @@ func run(address, username, password, command string) error {
 			continue
 		}
 
+		if text == "SYN" {
+			continue
+		}
+
 		if isCedroStatus(text) {
 			log.Printf("status: %s", text)
 			continue
 		}
 
-		acc.Add("CEDRO", cedroTick{
-			TimeMSC: time.Now().UTC().UnixMilli(),
+		ts := time.Now().UTC().UnixMilli()
+		acc.Add(cedroTick{
+			TimeMSC: ts,
+			Symbol:  parseSymbol(text),
 			Raw:     text,
 		})
 	}
@@ -226,6 +243,38 @@ func waitForToken(reader *bufio.Reader, tokens []string) (string, error) {
 	}
 }
 
+func parseSymbol(text string) string {
+	parts := strings.Split(text, ":")
+	if len(parts) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(parts[1])
+}
+
+func splitCommands(input string) []string {
+	if strings.TrimSpace(input) == "" {
+		return nil
+	}
+	raw := strings.Split(input, ",")
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		cmd := strings.TrimSpace(item)
+		if cmd == "" {
+			continue
+		}
+		out = append(out, cmd)
+	}
+	return out
+}
+
+func truncateForLog(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "..."
+}
+
 func isCedroStatus(text string) bool {
 	switch text {
 	case "Connecting...",
@@ -240,11 +289,11 @@ func isCedroStatus(text string) bool {
 }
 
 type tickAccumulator struct {
-	mu       sync.Mutex
+	mu      sync.Mutex
 	bySymbol map[string][]cedroTick
-	ticker   *time.Ticker
-	stopCh   chan struct{}
-	flushFn  func(symbol string, entries []cedroTick) error
+	ticker  *time.Ticker
+	stopCh  chan struct{}
+	flushFn func(symbol string, entries []cedroTick) error
 }
 
 func newTickAccumulator(interval time.Duration, flushFn func(symbol string, entries []cedroTick) error) *tickAccumulator {
@@ -259,11 +308,15 @@ func newTickAccumulator(interval time.Duration, flushFn func(symbol string, entr
 	return acc
 }
 
-func (a *tickAccumulator) Add(symbol string, tick cedroTick) {
-	if symbol == "" || tick.Raw == "" {
+func (a *tickAccumulator) Add(tick cedroTick) {
+	if tick.Raw == "" {
 		return
 	}
 	a.mu.Lock()
+	symbol := tick.Symbol
+	if symbol == "" {
+		symbol = "UNKNOWN"
+	}
 	a.bySymbol[symbol] = append(a.bySymbol[symbol], tick)
 	a.mu.Unlock()
 }
@@ -305,43 +358,59 @@ func (a *tickAccumulator) flush() {
 	}
 }
 
-func writeCSV(symbol string, ticks []cedroTick) error {
-	timestamp := ticks[0].TimeMSC
-	if timestamp <= 0 {
-		timestamp = time.Now().UTC().UnixMilli()
+func writeCSV(uploadDir, symbol string, ticks []cedroTick) error {
+	type bucket struct {
+		dateDir string
+		minute  string
 	}
 
-	dateDir := time.UnixMilli(timestamp).UTC().Format("2006-01-02")
-	symbolDir := filepath.Join(uploadDir, dateDir, symbol)
-	if err := os.MkdirAll(symbolDir, 0o755); err != nil {
-		return err
-	}
-
-	outPath := filepath.Join(symbolDir, fmt.Sprintf("%d.csv", timestamp))
-	outFile, err := os.Create(outPath)
-	if err != nil {
-		return err
-	}
-	defer outFile.Close()
-
-	writer := csv.NewWriter(outFile)
-	if err := writer.Write([]string{"time_msc", "raw"}); err != nil {
-		return err
-	}
+	groups := make(map[bucket][]cedroTick)
+	order := make([]bucket, 0, 8)
 
 	for _, tick := range ticks {
-		row := []string{
-			fmt.Sprintf("%d", tick.TimeMSC),
-			tick.Raw,
+		ts := tick.TimeMSC
+		if ts <= 0 {
+			ts = time.Now().UTC().UnixMilli()
 		}
-		if err := writer.Write(row); err != nil {
-			return err
+		tm := time.UnixMilli(ts).UTC()
+		key := bucket{
+			dateDir: tm.Format("2006-01-02"),
+			minute:  tm.Format("15_04"),
 		}
+		if _, ok := groups[key]; !ok {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], tick)
 	}
 
-	writer.Flush()
-	if err := writer.Error(); err != nil {
-		return err
+	for _, key := range order {
+		targetDir := filepath.Join(uploadDir, key.dateDir, symbol)
+		if err := os.MkdirAll(targetDir, 0o755); err != nil {
+			return err
+		}
+
+		entries := groups[key]
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].TimeMSC < entries[j].TimeMSC
+		})
+
+		outPath := filepath.Join(targetDir, fmt.Sprintf("%s.csv", key.minute))
+		outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return err
+		}
+
+		for _, tick := range entries {
+			line := fmt.Sprintf("%d|%s\n", tick.TimeMSC, tick.Raw)
+			if _, err := outFile.WriteString(line); err != nil {
+				_ = outFile.Close()
+				return err
+			}
+		}
+
+		if err := outFile.Close(); err != nil {
+			return err
+		}
 	}
 
 	return nil
