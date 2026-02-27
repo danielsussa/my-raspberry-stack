@@ -1,42 +1,45 @@
 #!/bin/sh
 set -eu
 
-if [ -z "${OPENAI_API_KEY:-}" ]; then
-  echo "OPENAI_API_KEY is required"
-  exit 1
+if [ -z "${CODEX_API_KEY:-}" ]; then
+  if [ -n "${OPENAI_API_KEY:-}" ]; then
+    export CODEX_API_KEY="$OPENAI_API_KEY"
+  else
+    echo "CODEX_API_KEY (or OPENAI_API_KEY) is required"
+    exit 1
+  fi
 fi
 
-MODEL="${OPENAI_MODEL:-gpt-4.1-mini}"
 PROMPT="${PROMPT:-Hey bot, tell me something new today.}"
 PROMPT="$PROMPT (Today: $(date -I))"
-USE_WEB_SEARCH="${USE_WEB_SEARCH:-false}"
+OUT_FILE="${OUT_FILE:-/data/my-notes.md}"
+WORKSPACE="${WORKSPACE:-/workspace}"
+MODEL="${CODEX_MODEL:-}"
 
-payload=$(jq -n --arg model "$MODEL" --arg input "$PROMPT" '{model: $model, input: $input, store: false}')
-if [ "$USE_WEB_SEARCH" = "true" ]; then
-  payload=$(echo "$payload" | jq '.tools=[{"type":"web_search"}]')
+MODEL_ARGS=""
+if [ -n "$MODEL" ]; then
+  MODEL_ARGS="--model $MODEL"
 fi
 
-response=$(curl -sS https://api.openai.com/v1/responses \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "$payload")
+set +e
+cd "$WORKSPACE"
+note=$(codex exec --ephemeral $MODEL_ARGS "$PROMPT" 2>>/proc/1/fd/1)
+status=$?
+set -e
 
-text=$(echo "$response" | jq -r '[.output[]? | select(.type=="message") | .content[]? | select(.type=="output_text") | .text] | join("\n")')
-
-if [ -z "$text" ] || [ "$text" = "null" ]; then
+if [ $status -ne 0 ] || [ -z "$note" ]; then
   {
     echo "## $(date -Iseconds)"
-    echo "ERROR: empty response"
-    echo "$response" | jq -c '.'
+    echo "ERROR: codex exec failed (status=$status)"
     echo
-  } >> /app/my-notes.md
+  } >> "$OUT_FILE"
   exit 1
 fi
 
 {
   echo "## $(date -Iseconds)"
-  echo "$text"
+  echo "$note"
   echo
-} >> /app/my-notes.md
+} >> "$OUT_FILE"
 
 echo "Wrote note at $(date -Iseconds)"

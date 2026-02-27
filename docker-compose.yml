@@ -34,6 +34,22 @@ services:
     volumes:
       - ./.data/cedro-ticker-uploader:/data/cedro-ticker-uploader
 
+  gen-ai-hello-notes:
+    build:
+      context: ./services/gen-ai-hello-notes
+    container_name: gen-ai-hello-notes
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PROMPT=${GEN_AI_HELLO_NOTES_PROMPT:-Hey bot, tell me something new today.}
+      - CODEX_API_KEY=${OPENAI_API_KEY}
+      - CODEX_MODEL=${GEN_AI_HELLO_NOTES_MODEL:-gpt-4.1-mini}
+      - OUT_FILE=/data/my-notes.md
+    volumes:
+      - ./:/workspace
+      - ./.data/gen-ai-hello-notes:/data
+
   market-visual-runner:
     build:
       context: ./services/market-visual-runner

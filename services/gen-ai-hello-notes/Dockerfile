@@ -1,12 +1,13 @@
-FROM alpine:3.20
+FROM node:20-alpine
 
-RUN apk add --no-cache curl jq tzdata
+RUN apk add --no-cache git tzdata \
+  && npm install -g @openai/codex
 
-WORKDIR /app
+WORKDIR /workspace
 
 COPY run-notes.sh /app/run-notes.sh
-COPY crontab /etc/crontabs/root
+COPY loop.sh /app/loop.sh
 
-RUN chmod +x /app/run-notes.sh
+RUN chmod +x /app/run-notes.sh /app/loop.sh
 
-CMD ["crond", "-f", "-l", "8", "-L", "/dev/stdout"]
+CMD ["/app/loop.sh"]
