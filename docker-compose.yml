@@ -50,6 +50,21 @@ services:
       - ./:/workspace
       - ./.data/gen-ai-hello-notes:/data
 
+  massive-news:
+    build:
+      context: ./services/massive-news
+    container_name: massive-news
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - MASSIVE_NEWS_LIMIT=10
+      - MASSIVE_NEWS_ORDER=asc
+      - MASSIVE_NEWS_SORT=published_utc
+      - MASSIVE_NEWS_INTERVAL_SECONDS=${MASSIVE_NEWS_INTERVAL_SECONDS:-3600}
+    volumes:
+      - ./.data/massive-news:/data
+
   market-visual-runner:
     build:
       context: ./services/market-visual-runner
