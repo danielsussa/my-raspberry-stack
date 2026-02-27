@@ -63,12 +63,14 @@ func main() {
 	allowedOrigins := parseOrigins(envOrDefault("BFF_ALLOWED_ORIGINS", "*"))
 	dataDirs := parseDirs(envOrDefault("DATA_DIRS", "/data/cedro-ticker-uploader,/data/massive-ticker-uploader"))
 	cacheTTL := time.Minute
+	refreshInterval := 30 * time.Minute
 	cache := &timeframeCache{}
 	store := newDataStore()
 
 	if err := store.loadFromDirs(dataDirs); err != nil {
 		log.Printf("failed to preload data: %v", err)
 	}
+	go startDataReloader(refreshInterval, dataDirs, store, cache)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -776,4 +778,26 @@ func (c *timeframeCache) getOrBuild(ttl time.Duration, build func() (timeframeRe
 	c.payload = payload
 	c.updatedAt = time.Now()
 	return payload, nil
+}
+
+func (c *timeframeCache) reset() {
+	c.mu.Lock()
+	c.payload = timeframeResponse{}
+	c.updatedAt = time.Time{}
+	c.mu.Unlock()
+}
+
+func startDataReloader(interval time.Duration, dataDirs []string, store *dataStore, cache *timeframeCache) {
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := store.loadFromDirs(dataDirs); err != nil {
+			log.Printf("failed to reload data: %v", err)
+			continue
+		}
+		cache.reset()
+	}
 }
