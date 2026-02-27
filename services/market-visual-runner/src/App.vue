@@ -244,6 +244,16 @@ const formatDateTime = (date) => {
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 };
 
+const computeResolutionSeconds = (start, end) => {
+  if (!(start instanceof Date) || !(end instanceof Date)) return 300;
+  const diffMs = end.getTime() - start.getTime();
+  if (!Number.isFinite(diffMs) || diffMs < 0) return 300;
+  const minutes = Math.max(Math.round(diffMs / 60_000) + 1, 1);
+  if (minutes < 10) return 1;
+  if (minutes < 120) return 20;
+  return 60;
+};
+
 const setChartRef = (symbol) => (el) => {
   if (el) {
     chartRefs.set(symbol, el);
@@ -255,10 +265,13 @@ const setChartRef = (symbol) => (el) => {
 const renderCharts = async () => {
   if (!symbols.value.length) return;
   if (!timeframe.value?.start) return;
+  dragState.active = false;
+  dragState.chart = null;
   const base = new Date(timeframe.value.start);
   if (Number.isNaN(base.getTime())) return;
   const startTime = new Date(base.getTime() + rangeStart.value * resolutionMinutes.value * 60_000);
   const endTime = new Date(base.getTime() + (rangeEnd.value + 1) * resolutionMinutes.value * 60_000 - 60_000);
+  const resolutionSeconds = computeResolutionSeconds(startTime, endTime);
   const qualityMap = new Map(
     (timeframe.value?.frame_quality ?? []).map((entry) => [entry.symbol, entry.quality])
   );
@@ -268,7 +281,7 @@ const renderCharts = async () => {
   try {
     payloads = await Promise.all(
       symbols.value.map(async (symbol) => {
-        const result = await fetchPriceOverview(symbol, startTime, endTime);
+        const result = await fetchPriceOverview(symbol, startTime, endTime, resolutionSeconds);
         return { symbol, result };
       })
     );
@@ -292,13 +305,24 @@ const renderCharts = async () => {
     const canvas = chartRefs.get(symbol);
     if (!canvas) return;
     if (chartInstances.has(symbol)) {
-      chartInstances.get(symbol).destroy();
+      const existing = chartInstances.get(symbol);
+      if (existing?.canvas) {
+        existing.canvas.__chartRef = null;
+      }
+      existing.destroy();
       chartInstances.delete(symbol);
     }
     const flags = qualityMap.get(symbol) ?? [];
     const data = result?.prices ?? [];
     const labels = result?.datetimes ?? [];
-    const gaps = buildGapRanges(flags, rangeStart.value, rangeEnd.value, resolutionMinutes.value);
+    const gaps = buildGapRanges(
+      flags,
+      rangeStart.value,
+      rangeEnd.value,
+      resolutionMinutes.value,
+      resolutionSeconds,
+      data.length - 1
+    );
     const chart = new Chart(canvas, {
       plugins: [
         {
@@ -406,7 +430,15 @@ const renderCharts = async () => {
         },
       },
     });
+    chart.__rangeMeta = {
+      baseMs: startTime.getTime(),
+      resolutionSeconds,
+      tfBaseMs: base.getTime(),
+      bucketMs: resolutionMinutes.value * 60_000,
+      maxIndex: Math.max(labels.length - 1, 0),
+    };
     chartInstances.set(symbol, chart);
+    canvas.__chartRef = chart;
     installHoverSync(canvas, chart);
     installRangeSelection(canvas, chart);
   });
@@ -427,7 +459,9 @@ const installHoverSync = (canvas, chart) => {
     clearHoverSync();
   });
   canvas.addEventListener("mousemove", (event) => {
-    const points = chart.getElementsAtEventForMode(event, "index", { intersect: false }, false);
+    const current = canvas.__chartRef ?? chart;
+    if (!current?.canvas) return;
+    const points = current.getElementsAtEventForMode(event, "index", { intersect: false }, false);
     if (!points.length) {
       clearHoverSync();
       return;
@@ -461,17 +495,30 @@ const getIndexFromEvent = (chart, event) => {
   const x = event.clientX - rect.left;
   const minuteIndex = Math.round(scale.getValueForPixel(x));
   if (!Number.isFinite(minuteIndex)) return null;
-  const maxMinutes = Math.max((rangeEnd.value - rangeStart.value + 1) * resolutionMinutes.value - 1, 0);
-  return Math.min(Math.max(minuteIndex, 0), maxMinutes);
+  const maxIndex =
+    typeof chart?.__rangeMeta?.maxIndex === "number"
+      ? chart.__rangeMeta.maxIndex
+      : Math.max((chart.data?.labels?.length ?? 1) - 1, 0);
+  return Math.min(Math.max(minuteIndex, 0), maxIndex);
 };
 
 const finalizeRangeSelection = () => {
   if (!dragState.active || !dragState.chart) return;
   const startMinute = Math.min(dragState.startIndex, dragState.currentIndex);
   const endMinute = Math.max(dragState.startIndex, dragState.currentIndex);
-  const baseMinute = rangeStart.value * resolutionMinutes.value;
-  const startBucket = Math.floor((baseMinute + startMinute) / resolutionMinutes.value);
-  const endBucket = Math.floor((baseMinute + endMinute) / resolutionMinutes.value);
+  const meta = dragState.chart.__rangeMeta;
+  let startBucket = 0;
+  let endBucket = 0;
+  if (meta?.baseMs != null && meta?.resolutionSeconds != null && meta?.tfBaseMs != null && meta?.bucketMs != null) {
+    const startTimeMs = meta.baseMs + startMinute * meta.resolutionSeconds * 1000;
+    const endTimeMs = meta.baseMs + endMinute * meta.resolutionSeconds * 1000;
+    startBucket = Math.floor((startTimeMs - meta.tfBaseMs) / meta.bucketMs);
+    endBucket = Math.floor((endTimeMs - meta.tfBaseMs) / meta.bucketMs);
+  } else {
+    const baseMinute = rangeStart.value * resolutionMinutes.value;
+    startBucket = Math.floor((baseMinute + startMinute) / resolutionMinutes.value);
+    endBucket = Math.floor((baseMinute + endMinute) / resolutionMinutes.value);
+  }
   dragState.active = false;
   dragState.chart.update("none");
   dragState.chart = null;
@@ -487,37 +534,51 @@ const finalizeRangeSelection = () => {
 const installRangeSelection = (canvas, chart) => {
   if (canvas.__rangeSelectInstalled) return;
   canvas.__rangeSelectInstalled = true;
-  canvas.addEventListener("mousedown", (event) => {
-    if (event.button !== 0) return;
-    const index = getIndexFromEvent(chart, event);
+  canvas.style.touchAction = "none";
+  canvas.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    event.preventDefault();
+    const current = canvas.__chartRef ?? chart;
+    if (!current?.canvas) return;
+    const index = getIndexFromEvent(current, event);
     if (index == null) return;
     dragState.active = true;
     dragState.startIndex = index;
     dragState.currentIndex = index;
-    dragState.chart = chart;
-    chart.update("none");
+    dragState.chart = current;
+    canvas.setPointerCapture(event.pointerId);
+    current.update("none");
   });
-  canvas.addEventListener("mousemove", (event) => {
-    if (!dragState.active || dragState.chart !== chart) return;
-    const index = getIndexFromEvent(chart, event);
+  canvas.addEventListener("pointermove", (event) => {
+    const current = canvas.__chartRef ?? chart;
+    if (!dragState.active || dragState.chart !== current) return;
+    event.preventDefault();
+    const index = getIndexFromEvent(current, event);
     if (index == null) return;
     dragState.currentIndex = index;
-    chart.update("none");
+    current.update("none");
   });
-  canvas.addEventListener("mouseup", () => {
-    finalizeRangeSelection();
+  canvas.addEventListener("pointerup", (event) => {
+    const current = canvas.__chartRef ?? chart;
+    if (dragState.active && dragState.chart === current) {
+      canvas.releasePointerCapture(event.pointerId);
+      finalizeRangeSelection();
+    }
   });
-  canvas.addEventListener("mouseleave", () => {
-    if (dragState.active && dragState.chart === chart) {
+  canvas.addEventListener("pointerleave", (event) => {
+    const current = canvas.__chartRef ?? chart;
+    if (dragState.active && dragState.chart === current) {
+      canvas.releasePointerCapture(event.pointerId);
       finalizeRangeSelection();
     }
   });
 };
 
-const fetchPriceOverview = async (symbol, start, end) => {
+const fetchPriceOverview = async (symbol, start, end, resolutionSeconds) => {
   const params = new URLSearchParams({
     start: formatDateTime(start),
     end: formatDateTime(end),
+    resolution: String(resolutionSeconds),
   });
   const response = await fetch(`/market-visual-runner-bff/symbols/${encodeURIComponent(symbol)}/price-overview?${params}`);
   if (response.status === 404) {
@@ -529,7 +590,7 @@ const fetchPriceOverview = async (symbol, start, end) => {
   return response.json();
 };
 
-const buildGapRanges = (flags, startIdx, endIdx, stepMinutes) => {
+const buildGapRanges = (flags, startIdx, endIdx, stepMinutes, resolutionSeconds, maxIndex) => {
   const ranges = [];
   let inGap = false;
   let gapStart = startIdx;
@@ -556,7 +617,23 @@ const buildGapRanges = (flags, startIdx, endIdx, stepMinutes) => {
     if (endMinute > maxOffset) endMinute = maxOffset;
     expanded.push([startMinute, endMinute]);
   });
-  return expanded;
+  if (!resolutionSeconds || resolutionSeconds === 60) return expanded;
+  const bucketSeconds = Math.max(resolutionSeconds, 1);
+  const remapped = expanded
+    .map(([startMinute, endMinute]) => {
+      const startSec = startMinute * 60;
+      const endSec = (endMinute + 1) * 60 - 1;
+      let startBucket = Math.floor(startSec / bucketSeconds);
+      let endBucket = Math.floor(endSec / bucketSeconds);
+      if (typeof maxIndex === "number") {
+        startBucket = Math.min(Math.max(startBucket, 0), maxIndex);
+        endBucket = Math.min(Math.max(endBucket, 0), maxIndex);
+      }
+      if (endBucket < startBucket) return null;
+      return [startBucket, endBucket];
+    })
+    .filter(Boolean);
+  return remapped;
 };
 
 </script>

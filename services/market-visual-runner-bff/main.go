@@ -139,8 +139,13 @@ func main() {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		resolutionSeconds, err := parseResolutionSeconds(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
-		resp, ok, err := store.buildPriceOverview(symbol, start, end)
+		resp, ok, err := store.buildPriceOverview(symbol, start, end, resolutionSeconds)
 		if err != nil {
 			http.Error(w, "could not build price overview", http.StatusInternalServerError)
 			return
@@ -282,6 +287,19 @@ func parseStartEnd(r *http.Request) (time.Time, time.Time, error) {
 	}
 
 	return start, end, nil
+}
+
+func parseResolutionSeconds(r *http.Request) (int, error) {
+	query := r.URL.Query()
+	raw := strings.TrimSpace(query.Get("resolution"))
+	if raw == "" {
+		return 300, nil
+	}
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds <= 0 {
+		return 0, errors.New("resolution must be a positive integer in seconds")
+	}
+	return seconds, nil
 }
 
 func parseDateTime(value string) (time.Time, error) {
@@ -564,16 +582,24 @@ func (s *dataStore) buildTimeframeResponse() (timeframeResponse, error) {
 	}, nil
 }
 
-func (s *dataStore) buildPriceOverview(symbol string, start, end time.Time) (priceOverviewResponse, bool, error) {
-	start = start.UTC().Truncate(time.Minute)
-	end = end.UTC().Truncate(time.Minute)
-	minutes := int(end.Sub(start).Minutes()) + 1
-	if minutes < 1 {
-		minutes = 1
+func (s *dataStore) buildPriceOverview(symbol string, start, end time.Time, resolutionSeconds int) (priceOverviewResponse, bool, error) {
+	start = start.UTC().Truncate(time.Second)
+	end = end.UTC().Truncate(time.Second)
+	if resolutionSeconds <= 0 {
+		resolutionSeconds = 300
 	}
+	resolutionDuration := time.Duration(resolutionSeconds) * time.Second
+	if end.Before(start) {
+		end = start
+	}
+	totalSeconds := int(end.Sub(start).Seconds())
+	if totalSeconds < 0 {
+		totalSeconds = 0
+	}
+	buckets := totalSeconds/resolutionSeconds + 1
 
-	datetimes := make([]string, 0, minutes)
-	prices := make([]*float64, 0, minutes)
+	datetimes := make([]string, 0, buckets)
+	prices := make([]*float64, 0, buckets)
 
 	s.mu.RLock()
 	points := s.priceBySymbol[symbol]
@@ -583,17 +609,40 @@ func (s *dataStore) buildPriceOverview(symbol string, start, end time.Time) (pri
 	}
 
 	hasAny := false
-	for i := 0; i < minutes; i++ {
-		t := start.Add(time.Duration(i) * time.Minute)
-		datetimes = append(datetimes, formatDateTime(t))
-		key := t.Unix()
-		point, ok := points[key]
-		if !ok {
+	for i := 0; i < buckets; i++ {
+		bucketStart := start.Add(time.Duration(i) * resolutionDuration)
+		if bucketStart.After(end) {
+			break
+		}
+		bucketEnd := bucketStart.Add(resolutionDuration - time.Second)
+		if bucketEnd.After(end) {
+			bucketEnd = end
+		}
+		datetimes = append(datetimes, formatDateTime(bucketStart))
+
+		var latest *float64
+		if resolutionSeconds < 60 {
+			key := bucketEnd.Truncate(time.Minute).Unix()
+			if point, ok := points[key]; ok {
+				value := point.price
+				latest = &value
+			}
+		} else {
+			for t := bucketStart.Truncate(time.Minute); !t.After(bucketEnd); t = t.Add(time.Minute) {
+				key := t.Unix()
+				point, ok := points[key]
+				if !ok {
+					continue
+				}
+				value := point.price
+				latest = &value
+			}
+		}
+		if latest == nil {
 			prices = append(prices, nil)
 			continue
 		}
-		value := point.price
-		prices = append(prices, &value)
+		prices = append(prices, latest)
 		hasAny = true
 	}
 
@@ -602,7 +651,7 @@ func (s *dataStore) buildPriceOverview(symbol string, start, end time.Time) (pri
 	}
 
 	return priceOverviewResponse{
-		Resolution: "1min",
+		Resolution: strconv.Itoa(resolutionSeconds) + "s",
 		Prices:     prices,
 		Datetimes:  datetimes,
 	}, true, nil
