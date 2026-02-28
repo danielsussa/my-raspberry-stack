@@ -109,6 +109,7 @@ services:
       INTRADAY_AI_PREDICT_WORKSPACE: "/data/intraday-ai-predict/workspace"
       INTRADAY_AI_PREDICT_OUT_FILE: "/data/intraday-ai-predict/predictions.md"
       INTRADAY_AI_PREDICT_STOP_TOKEN: "${INTRADAY_AI_PREDICT_STOP_TOKEN:-END_SESSION}"
+      INTRADAY_AI_PREDICT_SESSION_DIR: "${INTRADAY_AI_PREDICT_SESSION_DIR:-}"
     volumes:
       - ./.data/intraday-ai-predict:/data/intraday-ai-predict
       - ./services/intraday-ai-predict/AI_README.md:/data/intraday-ai-predict/AI_README.md:ro

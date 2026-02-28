@@ -4,7 +4,7 @@ Clona a ideia do `gen-ai-hello-notes`: executa o Codex em loop dentro de uma pas
 
 ## Como usar (host)
 
-1) Coloque os dados em `./.data/intraday-ai-predict/workspace` (essa pasta sera o workspace do Codex).
+1) Gere a sessao de dados usando `services/intraday-ai-predict/copy.sh`.
 
 2) Execute no host:
 
@@ -24,6 +24,7 @@ scripts/run-intraday-host.sh
 - `INTRADAY_AI_PREDICT_DATA_ROOT`: raiz de dados a limpar (default: `/data/intraday-ai-predict`)
 - `INTRADAY_AI_PREDICT_INTERVAL_SECONDS`: intervalo entre execucoes (default: 3600)
 - `INTRADAY_AI_PREDICT_WORKSPACE`: caminho do workspace (default: `.data/intraday-ai-predict/workspace`)
+- `INTRADAY_AI_PREDICT_SESSION_DIR`: caminho da sessao a copiar para `WORKSPACE/.data` (opcional)
 - `INTRADAY_AI_PREDICT_OUT_FILE`: arquivo de saida (default: `.data/intraday-ai-predict/predictions.md`)
 
 ## Saida
