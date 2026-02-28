@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"encoding/hex"
 	"io"
 	"log"
 	"net/http"
@@ -15,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 type statusResponse struct {
@@ -48,6 +52,70 @@ type timeframeCache struct {
 	payload   timeframeResponse
 }
 
+type computeState struct {
+	ComputeMode bool           `json:"compute_mode"`
+	RangeStart  int            `json:"range_start"`
+	RangeEnd    int            `json:"range_end"`
+	Markers     map[string]int `json:"markers,omitempty"`
+	TicksRequested int         `json:"ticks_requested"`
+	LastSymbol     string      `json:"last_symbol,omitempty"`
+	RangeStartTime string      `json:"range_start_time,omitempty"`
+	RangeEndTime   string      `json:"range_end_time,omitempty"`
+	Resolution     string      `json:"resolution,omitempty"`
+	CustomResolutionSeconds int `json:"custom_resolution_seconds,omitempty"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+}
+
+type sessionManager struct {
+	mu       sync.RWMutex
+	sessions map[string]*computeState
+}
+
+type wsRequest struct {
+	Type       string   `json:"type"`
+	RequestID  string   `json:"request_id,omitempty"`
+	Symbol     string   `json:"symbol,omitempty"`
+	Symbols    []string `json:"symbols,omitempty"`
+	Start      string   `json:"start,omitempty"`
+	End        string   `json:"end,omitempty"`
+	RangeStart int      `json:"range_start,omitempty"`
+	RangeEnd   int      `json:"range_end,omitempty"`
+	ComputeMode *bool  `json:"compute_mode,omitempty"`
+	Resolution int      `json:"resolution,omitempty"`
+	Ticks      int      `json:"ticks,omitempty"`
+	State      *computeStatePayload `json:"state,omitempty"`
+}
+
+type wsResponse struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id,omitempty"`
+	Data      any    `json:"data,omitempty"`
+	Message   string `json:"message,omitempty"`
+}
+
+type wsPriceOverviewItem struct {
+	Symbol string                `json:"symbol"`
+	Data   *priceOverviewResponse `json:"data,omitempty"`
+}
+
+type wsIncreaseResolutionPayload struct {
+	ResolutionSeconds int                  `json:"resolution_seconds"`
+	Items             []wsPriceOverviewItem `json:"items"`
+}
+
+type computeStatePayload struct {
+	ComputeMode bool           `json:"compute_mode"`
+	RangeStart  int            `json:"range_start"`
+	RangeEnd    int            `json:"range_end"`
+	Markers     map[string]int `json:"markers,omitempty"`
+	TicksRequested int         `json:"ticks_requested"`
+	LastSymbol     string      `json:"last_symbol,omitempty"`
+	RangeStartTime string      `json:"range_start_time,omitempty"`
+	RangeEndTime   string      `json:"range_end_time,omitempty"`
+	Resolution     string      `json:"resolution,omitempty"`
+	CustomResolutionSeconds int `json:"custom_resolution_seconds,omitempty"`
+}
+
 type dataStore struct {
 	mu              sync.RWMutex
 	startTS         int64
@@ -66,6 +134,7 @@ func main() {
 	refreshInterval := 30 * time.Minute
 	cache := &timeframeCache{}
 	store := newDataStore()
+	sessions := newSessionManager()
 
 	if err := store.loadFromDirs(dataDirs); err != nil {
 		log.Printf("failed to preload data: %v", err)
@@ -99,63 +168,7 @@ func main() {
 		writeJSON(w, http.StatusOK, resp)
 	})
 
-	mux.HandleFunc("/timeframe", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-
-		resp, err := cache.getOrBuild(cacheTTL, func() (timeframeResponse, error) {
-			return store.buildTimeframeResponse()
-		})
-		if err != nil {
-			http.Error(w, "could not build timeframe", http.StatusInternalServerError)
-			return
-		}
-
-		writeJSON(w, http.StatusOK, resp)
-	})
-
-	mux.HandleFunc("/symbols/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-
-		path := strings.TrimPrefix(r.URL.Path, "/symbols/")
-		if !strings.HasSuffix(path, "/price-overview") {
-			http.NotFound(w, r)
-			return
-		}
-		symbol := strings.TrimSuffix(path, "/price-overview")
-		symbol = strings.Trim(symbol, "/")
-		if symbol == "" {
-			http.Error(w, "missing symbol", http.StatusBadRequest)
-			return
-		}
-
-		start, end, err := parseStartEnd(r)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		resolutionSeconds, err := parseResolutionSeconds(r)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		resp, ok, err := store.buildPriceOverview(symbol, start, end, resolutionSeconds)
-		if err != nil {
-			http.Error(w, "could not build price overview", http.StatusInternalServerError)
-			return
-		}
-		if !ok {
-			http.Error(w, "no data for symbol", http.StatusNotFound)
-			return
-		}
-		writeJSON(w, http.StatusOK, resp)
-	})
+	mux.HandleFunc("/ws", handleWebsocket(store, cache, cacheTTL, allowedOrigins, dataDirs, sessions))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -198,6 +211,208 @@ func withCORS(next http.Handler, allowedOrigins []string) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func handleWebsocket(store *dataStore, cache *timeframeCache, cacheTTL time.Duration, allowedOrigins []string, dataDirs []string, sessions *sessionManager) http.HandlerFunc {
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  4096,
+		WriteBufferSize: 4096,
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true
+			}
+			return originAllowed(origin, allowedOrigins)
+		},
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessionID, created := sessions.getOrCreateID(r)
+		headers := http.Header{}
+		if created {
+			headers.Add("Set-Cookie", buildSessionCookie(sessionID))
+		}
+		conn, err := upgrader.Upgrade(w, r, headers)
+		if err != nil {
+			log.Printf("ws upgrade failed: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		for {
+			var msg wsRequest
+			if err := conn.ReadJSON(&msg); err != nil {
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					return
+				}
+				log.Printf("ws read error: %v", err)
+				return
+			}
+
+			switch strings.TrimSpace(msg.Type) {
+			case "state_get":
+				state := sessions.getState(sessionID)
+				_ = conn.WriteJSON(wsResponse{Type: "state", RequestID: msg.RequestID, Data: state})
+
+			case "state_update":
+				if msg.State == nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: "missing state"})
+					continue
+				}
+				sessions.setState(sessionID, msg.State.toComputeState())
+				_ = conn.WriteJSON(wsResponse{Type: "state_update", RequestID: msg.RequestID, Data: map[string]string{"status": "ok"}})
+
+			case "range_selection":
+				start, end, err := parseStartEndStrings(msg.Start, msg.End)
+				if err != nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: err.Error()})
+					continue
+				}
+				sessions.updateRange(sessionID, start, end, msg.RangeStart, msg.RangeEnd, msg.ComputeMode)
+				_ = conn.WriteJSON(wsResponse{Type: "range_selection", RequestID: msg.RequestID, Data: map[string]string{"status": "ok"}})
+
+			case "state_reset":
+				state := sessions.resetState(sessionID)
+				_ = conn.WriteJSON(wsResponse{Type: "state_reset", RequestID: msg.RequestID, Data: state})
+
+			case "timeframe":
+				resp, err := cache.getOrBuild(cacheTTL, func() (timeframeResponse, error) {
+					return store.buildTimeframeResponse()
+				})
+				if err != nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: "could not build timeframe"})
+					continue
+				}
+				_ = conn.WriteJSON(wsResponse{Type: "timeframe", RequestID: msg.RequestID, Data: resp})
+
+			case "price_overview":
+				symbol := strings.TrimSpace(msg.Symbol)
+				if symbol == "" {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: "missing symbol"})
+					continue
+				}
+				start, end, err := parseStartEndStrings(msg.Start, msg.End)
+				if err != nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: err.Error()})
+					continue
+				}
+				resolutionSeconds, err := parseResolutionValue(msg.Resolution)
+				if err != nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: err.Error()})
+					continue
+				}
+				resp, ok, err := store.buildPriceOverview(symbol, start, end, resolutionSeconds)
+				if err != nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: "could not build price overview"})
+					continue
+				}
+				if !ok {
+					_ = conn.WriteJSON(wsResponse{Type: "price_overview", RequestID: msg.RequestID, Data: nil})
+					continue
+				}
+				_ = conn.WriteJSON(wsResponse{Type: "price_overview", RequestID: msg.RequestID, Data: resp})
+
+			case "price_overview_batch":
+				start, end, err := parseStartEndStrings(msg.Start, msg.End)
+				if err != nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: err.Error()})
+					continue
+				}
+				resolutionSeconds, err := parseResolutionValue(msg.Resolution)
+				if err != nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: err.Error()})
+					continue
+				}
+				items := make([]wsPriceOverviewItem, 0, len(msg.Symbols))
+				for _, rawSymbol := range msg.Symbols {
+					symbol := strings.TrimSpace(rawSymbol)
+					if symbol == "" {
+						continue
+					}
+					resp, ok, err := store.buildPriceOverview(symbol, start, end, resolutionSeconds)
+					if err != nil {
+						_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: "could not build price overview"})
+						items = nil
+						break
+					}
+					if !ok {
+						items = append(items, wsPriceOverviewItem{Symbol: symbol})
+						continue
+					}
+					respCopy := resp
+					items = append(items, wsPriceOverviewItem{Symbol: symbol, Data: &respCopy})
+				}
+				if items == nil {
+					continue
+				}
+				_ = conn.WriteJSON(wsResponse{Type: "price_overview_batch", RequestID: msg.RequestID, Data: items})
+
+			case "compute_mode":
+				start, end, err := parseStartEndStrings(msg.Start, msg.End)
+				if err != nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: err.Error()})
+					continue
+				}
+				if err := store.loadFromDirsRange(dataDirs, start, end); err != nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: "could not load range"})
+					continue
+				}
+				cache.reset()
+				_ = conn.WriteJSON(wsResponse{Type: "compute_mode", RequestID: msg.RequestID, Data: map[string]string{"status": "ok"}})
+
+			case "increase_resolution":
+				start, end, err := parseStartEndStrings(msg.Start, msg.End)
+				if err != nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: err.Error()})
+					continue
+				}
+				ticks := msg.Ticks
+				if ticks <= 0 {
+					ticks = 5000
+				}
+				if err := store.loadFromDirsRange(dataDirs, start, end); err != nil {
+					_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: "could not load range"})
+					continue
+				}
+				cache.reset()
+				resolutionSeconds := computeResolutionSecondsForTicks(start, end, ticks)
+				symbols := msg.Symbols
+				if len(symbols) == 0 {
+					symbols = store.listSymbols()
+				}
+				items := make([]wsPriceOverviewItem, 0, len(symbols))
+				for _, rawSymbol := range symbols {
+					symbol := strings.TrimSpace(rawSymbol)
+					if symbol == "" {
+						continue
+					}
+					resp, ok, err := store.buildPriceOverview(symbol, start, end, resolutionSeconds)
+					if err != nil {
+						_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: "could not build price overview"})
+						items = nil
+						break
+					}
+					if !ok {
+						items = append(items, wsPriceOverviewItem{Symbol: symbol})
+						continue
+					}
+					respCopy := resp
+					items = append(items, wsPriceOverviewItem{Symbol: symbol, Data: &respCopy})
+				}
+				if items == nil {
+					continue
+				}
+				payload := wsIncreaseResolutionPayload{
+					ResolutionSeconds: resolutionSeconds,
+					Items:             items,
+				}
+				_ = conn.WriteJSON(wsResponse{Type: "increase_resolution", RequestID: msg.RequestID, Data: payload})
+
+			default:
+				_ = conn.WriteJSON(wsResponse{Type: "error", RequestID: msg.RequestID, Message: "unknown message type"})
+			}
+		}
+	}
 }
 
 func originAllowed(origin string, allowedOrigins []string) bool {
@@ -289,6 +504,37 @@ func parseStartEnd(r *http.Request) (time.Time, time.Time, error) {
 	return start, end, nil
 }
 
+func parseStartEndStrings(startRaw, endRaw string) (time.Time, time.Time, error) {
+	startRaw = strings.TrimSpace(startRaw)
+	endRaw = strings.TrimSpace(endRaw)
+
+	now := time.Now().UTC().Truncate(time.Minute)
+	start := now.Add(-60 * time.Minute)
+	end := now
+
+	if startRaw != "" {
+		parsed, err := parseDateTime(startRaw)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		start = parsed
+	}
+
+	if endRaw != "" {
+		parsed, err := parseDateTime(endRaw)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		end = parsed
+	}
+
+	if end.Before(start) {
+		return time.Time{}, time.Time{}, errors.New("end must be after start")
+	}
+
+	return start, end, nil
+}
+
 func parseResolutionSeconds(r *http.Request) (int, error) {
 	query := r.URL.Query()
 	raw := strings.TrimSpace(query.Get("resolution"))
@@ -300,6 +546,156 @@ func parseResolutionSeconds(r *http.Request) (int, error) {
 		return 0, errors.New("resolution must be a positive integer in seconds")
 	}
 	return seconds, nil
+}
+
+func parseResolutionValue(seconds int) (int, error) {
+	if seconds == 0 {
+		return 300, nil
+	}
+	if seconds < 0 {
+		return 0, errors.New("resolution must be a positive integer in seconds")
+	}
+	return seconds, nil
+}
+
+func computeResolutionSecondsForTicks(start, end time.Time, ticks int) int {
+	if ticks <= 1 {
+		return 60
+	}
+	if end.Before(start) {
+		return 60
+	}
+	totalSeconds := int(end.Sub(start).Seconds())
+	if totalSeconds <= 0 {
+		return 60
+	}
+	steps := ticks - 1
+	seconds := totalSeconds / steps
+	if totalSeconds%steps != 0 {
+		seconds += 1
+	}
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
+}
+
+func newSessionManager() *sessionManager {
+	return &sessionManager{
+		sessions: make(map[string]*computeState),
+	}
+}
+
+func (m *sessionManager) getOrCreateID(r *http.Request) (string, bool) {
+	if cookie, err := r.Cookie("mvr_session"); err == nil && cookie.Value != "" {
+		return cookie.Value, false
+	}
+	return newSessionID(), true
+}
+
+func (m *sessionManager) getState(id string) *computeState {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if state, ok := m.sessions[id]; ok {
+		return state
+	}
+	return nil
+}
+
+func (m *sessionManager) setState(id string, state *computeState) {
+	if id == "" || state == nil {
+		return
+	}
+	state.UpdatedAt = time.Now().UTC()
+	m.mu.Lock()
+	m.sessions[id] = state
+	m.mu.Unlock()
+}
+
+func (m *sessionManager) updateRange(id string, start, end time.Time, rangeStart, rangeEnd int, computeMode *bool) {
+	if id == "" {
+		return
+	}
+	m.mu.Lock()
+	state, ok := m.sessions[id]
+	if !ok || state == nil {
+		state = &computeState{}
+		m.sessions[id] = state
+	}
+	state.RangeStart = rangeStart
+	state.RangeEnd = rangeEnd
+	state.RangeStartTime = start.UTC().Format(time.RFC3339Nano)
+	state.RangeEndTime = end.UTC().Format(time.RFC3339Nano)
+	if computeMode != nil {
+		state.ComputeMode = *computeMode
+	}
+	state.UpdatedAt = time.Now().UTC()
+	m.mu.Unlock()
+}
+
+func (m *sessionManager) resetState(id string) *computeState {
+	if id == "" {
+		return nil
+	}
+	m.mu.Lock()
+	state := &computeState{
+		ComputeMode: false,
+		RangeStart:  0,
+		RangeEnd:    0,
+		Markers:     nil,
+		TicksRequested: 0,
+		LastSymbol:     "",
+		RangeStartTime: "",
+		RangeEndTime:   "",
+		Resolution:     "",
+		CustomResolutionSeconds: 0,
+		UpdatedAt:      time.Now().UTC(),
+	}
+	m.sessions[id] = state
+	m.mu.Unlock()
+	return state
+}
+
+func newSessionID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	return hex.EncodeToString(b)
+}
+
+func buildSessionCookie(id string) string {
+	return (&http.Cookie{
+		Name:     "mvr_session",
+		Value:    id,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	}).String()
+}
+
+func (p *computeStatePayload) toComputeState() *computeState {
+	if p == nil {
+		return nil
+	}
+	state := &computeState{
+		ComputeMode: p.ComputeMode,
+		RangeStart:  p.RangeStart,
+		RangeEnd:    p.RangeEnd,
+		TicksRequested: p.TicksRequested,
+		LastSymbol:     p.LastSymbol,
+		RangeStartTime: p.RangeStartTime,
+		RangeEndTime:   p.RangeEndTime,
+		Resolution:     p.Resolution,
+		CustomResolutionSeconds: p.CustomResolutionSeconds,
+	}
+	if len(p.Markers) > 0 {
+		state.Markers = make(map[string]int, len(p.Markers))
+		for k, v := range p.Markers {
+			state.Markers[k] = v
+		}
+	}
+	return state
 }
 
 func parseDateTime(value string) (time.Time, error) {
@@ -408,6 +804,40 @@ func (s *dataStore) loadFromDirs(rootDirs []string) error {
 	return nil
 }
 
+func (s *dataStore) loadFromDirsRange(rootDirs []string, start, end time.Time) error {
+	startTS := int64(0)
+	endTS := int64(0)
+	quality := make(map[string]map[int64]bool)
+	prices := make(map[string]map[int64]minutePrice)
+
+	startMs := start.UTC().UnixMilli()
+	endMs := end.UTC().UnixMilli()
+
+	for _, rootDir := range rootDirs {
+		if strings.TrimSpace(rootDir) == "" {
+			continue
+		}
+		if _, err := os.Stat(rootDir); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if err := loadFromDirRange(rootDir, startMs, endMs, quality, prices, &startTS, &endTS); err != nil {
+			return err
+		}
+	}
+
+	s.mu.Lock()
+	s.startTS = startTS
+	s.endTS = endTS
+	s.qualityBySymbol = quality
+	s.priceBySymbol = prices
+	s.mu.Unlock()
+
+	return nil
+}
+
 func loadFromDir(rootDir string, quality map[string]map[int64]bool, prices map[string]map[int64]minutePrice, startTS, endTS *int64) error {
 	dateDirs, err := os.ReadDir(rootDir)
 	if err != nil {
@@ -440,6 +870,58 @@ func loadFromDir(rootDir string, quality map[string]map[int64]bool, prices map[s
 				}
 				name := fileEntry.Name()
 				if !strings.HasSuffix(name, ".csv") {
+					continue
+				}
+				updateRangeFromPath(dateName, name, startTS, endTS)
+				path := filepath.Join(symbolPath, name)
+				if err := ingestFile(path, quality, prices, startTS, endTS); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func loadFromDirRange(rootDir string, startMs, endMs int64, quality map[string]map[int64]bool, prices map[string]map[int64]minutePrice, startTS, endTS *int64) error {
+	dateDirs, err := os.ReadDir(rootDir)
+	if err != nil {
+		return err
+	}
+
+	for _, dateEntry := range dateDirs {
+		if !dateEntry.IsDir() {
+			continue
+		}
+		dateName := dateEntry.Name()
+		datePath := filepath.Join(rootDir, dateName)
+		symbolDirs, err := os.ReadDir(datePath)
+		if err != nil {
+			return err
+		}
+		for _, symbolEntry := range symbolDirs {
+			if !symbolEntry.IsDir() {
+				continue
+			}
+			symbolPath := filepath.Join(datePath, symbolEntry.Name())
+			files, err := os.ReadDir(symbolPath)
+			if err != nil {
+				return err
+			}
+			for _, fileEntry := range files {
+				if fileEntry.IsDir() {
+					continue
+				}
+				name := fileEntry.Name()
+				if !strings.HasSuffix(name, ".csv") {
+					continue
+				}
+				ts, ok := parseDirFileTimestamp(dateName, name)
+				if !ok {
+					continue
+				}
+				if ts < startMs || ts > endMs {
 					continue
 				}
 				updateRangeFromPath(dateName, name, startTS, endTS)
@@ -655,6 +1137,20 @@ func (s *dataStore) buildPriceOverview(symbol string, start, end time.Time, reso
 		Prices:     prices,
 		Datetimes:  datetimes,
 	}, true, nil
+}
+
+func (s *dataStore) listSymbols() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.qualityBySymbol) == 0 {
+		return nil
+	}
+	symbols := make([]string, 0, len(s.qualityBySymbol))
+	for symbol := range s.qualityBySymbol {
+		symbols = append(symbols, symbol)
+	}
+	sort.Strings(symbols)
+	return symbols
 }
 
 func ingestFile(path string, quality map[string]map[int64]bool, prices map[string]map[int64]minutePrice, minTS, maxTS *int64) error {

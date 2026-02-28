@@ -24,6 +24,14 @@
           <div class="label">End (Data)</div>
           <div class="value">{{ timeframe?.end ?? "—" }}</div>
         </div>
+        <div>
+          <div class="label">Ticks Extra</div>
+          <div class="value">{{ ticksRequested || 0 }}</div>
+        </div>
+        <div>
+          <div class="label">Resolution (s)</div>
+          <div class="value">{{ customResolutionSeconds || "auto" }}</div>
+        </div>
       </div>
       <div class="slider-row">
         <div ref="sliderEl" class="noui-slider"></div>
@@ -31,27 +39,25 @@
         <div class="slider-note error" v-else-if="error">{{ error }}</div>
         <div class="slider-note" v-else-if="!minutesCount">Sem dados.</div>
       </div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-title">Status</div>
-      <div class="grid">
-        <div class="card">
-          <div class="label">Connection</div>
-          <div class="value ok">Ready</div>
-        </div>
-        <div class="card">
-          <div class="label">Last Refresh</div>
-          <div class="value">Just now</div>
-        </div>
-        <div class="card">
-          <div class="label">Instruments</div>
-          <div class="value">0</div>
-        </div>
-        <div class="card">
-          <div class="label">Ticks Today</div>
-          <div class="value">0</div>
-        </div>
+      <div class="panel-actions">
+        <button v-if="showAiPredict" type="button" class="ai-btn">AI PREDICT</button>
+        <button
+          v-if="hasSelection"
+          type="button"
+          class="increase-btn"
+          @click="requestMoreTicks"
+        >
+          INCREASE RESOLUTION
+        </button>
+        <button
+          v-if="hasSelection"
+          type="button"
+          class="zoom-btn"
+          @click="zoomToSelection"
+        >
+          ZOOM SELECTION
+        </button>
+        <button type="button" class="reset-btn" @click="resetSession">RESET</button>
       </div>
     </section>
 
@@ -73,19 +79,11 @@
       </div>
     </section>
 
-    <section class="panel">
-      <div class="panel-title">Next</div>
-      <ul class="list">
-        <li>Connect to stream endpoints.</li>
-        <li>Add filters for symbols and time ranges.</li>
-        <li>Render live charts and replay views.</li>
-      </ul>
-    </section>
   </div>
 </template>
 
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import Chart from "chart.js/auto";
 import noUiSlider from "nouislider";
 import "nouislider/dist/nouislider.css";
@@ -101,8 +99,27 @@ const sliderApi = ref(null);
 const chartRefs = new Map();
 const chartInstances = new Map();
 const visibleSymbols = ref([]);
+const wsRef = ref(null);
+const wsStatus = ref("disconnected");
+const wsRequests = new Map();
+let wsRequestSeq = 0;
 let renderToken = 0;
-const dragState = { active: false, startIndex: 0, currentIndex: 0, chart: null };
+const dragState = { active: false, startIndex: 0, currentIndex: 0, chart: null, didSelect: false };
+const computeMarkers = new Map();
+const selectionRanges = reactive(new Map());
+const showAiPredict = ref(false);
+const pendingState = ref(null);
+const ticksRequested = ref(0);
+const lastSymbol = ref("");
+const lastSelectionSymbol = ref("");
+const customResolutionSeconds = ref(0);
+let wsReconnectTimer = null;
+let wsReconnectAttempts = 0;
+let stateSaveTimer = null;
+let isApplyingState = false;
+const hasPendingState = computed(() => !!pendingState.value);
+const restoredRange = ref(false);
+const hasSelection = computed(() => selectionRanges.size > 0);
 
 const parseResolutionMinutes = (resolution) => {
   if (typeof resolution !== "string") return 1;
@@ -145,7 +162,7 @@ const startMinuteLabel = computed(() => {
   const base = new Date(timeframe.value.start);
   if (Number.isNaN(base.getTime())) return "";
   const current = new Date(base.getTime() + rangeStart.value * resolutionMinutes.value * 60_000);
-  return formatDateTime(current);
+  return formatDateTimeLabel(current);
 });
 
 const endMinuteLabel = computed(() => {
@@ -153,24 +170,23 @@ const endMinuteLabel = computed(() => {
   const base = new Date(timeframe.value.start);
   if (Number.isNaN(base.getTime())) return "";
   const current = new Date(base.getTime() + (rangeEnd.value + 1) * resolutionMinutes.value * 60_000 - 60_000);
-  return formatDateTime(current);
+  return formatDateTimeLabel(current);
 });
 
 const fetchTimeframe = async () => {
   loading.value = true;
   error.value = "";
   try {
-    const response = await fetch("/market-visual-runner-bff/timeframe");
-    if (!response.ok) {
-      throw new Error("Falha ao carregar timeframe.");
-    }
-    const data = await response.json();
+    const data = await fetchTimeframeWS();
     timeframe.value = data;
-    rangeStart.value = 0;
-    rangeEnd.value = endIndex.value;
-    clampRange();
+    if (!pendingState.value) {
+      rangeStart.value = 0;
+      rangeEnd.value = endIndex.value;
+      clampRange();
+    }
     initOrUpdateSlider();
     renderCharts();
+    applyPendingState();
   } catch (err) {
     error.value = err?.message ?? "Erro ao carregar timeframe.";
   } finally {
@@ -178,10 +194,17 @@ const fetchTimeframe = async () => {
   }
 };
 
-onMounted(fetchTimeframe);
+onMounted(() => {
+  connectWebsocket();
+  fetchTimeframe();
+});
 
-watch(rangeStart, clampRange);
-watch(rangeEnd, clampRange);
+watch(rangeStart, () => {
+  clampRange();
+});
+watch(rangeEnd, () => {
+  clampRange();
+});
 
 const initOrUpdateSlider = () => {
   if (!sliderEl.value || !minutesCount.value) return;
@@ -203,6 +226,7 @@ const initOrUpdateSlider = () => {
     });
     sliderApi.value.on("change", () => {
       renderCharts();
+      sendRangeSelectionNow();
     });
   } else {
     sliderApi.value.updateOptions(
@@ -213,11 +237,17 @@ const initOrUpdateSlider = () => {
       },
       true
     );
+    sliderApi.value.enable();
   }
 };
 
 watch(minutesCount, () => {
   if (!minutesCount.value) return;
+  if (hasPendingState.value || isApplyingState || restoredRange.value) {
+    initOrUpdateSlider();
+    renderCharts();
+    return;
+  }
   rangeEnd.value = endIndex.value;
   clampRange();
   initOrUpdateSlider();
@@ -231,9 +261,10 @@ onBeforeUnmount(() => {
   }
   chartInstances.forEach((chart) => chart.destroy());
   chartInstances.clear();
+  closeWebsocket();
 });
 
-const formatDateTime = (date) => {
+const formatDateTimeLabel = (date) => {
   if (!(date instanceof Date)) return "";
   const year = date.getUTCFullYear();
   const month = String(date.getUTCMonth() + 1).padStart(2, "0");
@@ -241,7 +272,12 @@ const formatDateTime = (date) => {
   const hours = String(date.getUTCHours()).padStart(2, "0");
   const minutes = String(date.getUTCMinutes()).padStart(2, "0");
   const seconds = String(date.getUTCSeconds()).padStart(2, "0");
-  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds} UTC`;
+};
+
+const formatDateTimeParam = (date) => {
+  if (!(date instanceof Date)) return "";
+  return date.toISOString();
 };
 
 const computeResolutionSeconds = (start, end) => {
@@ -262,35 +298,15 @@ const setChartRef = (symbol) => (el) => {
   }
 };
 
-const renderCharts = async () => {
-  if (!symbols.value.length) return;
+const renderChartsWithPayloads = async (payloads, startTime, endTime, resolutionSeconds) => {
   if (!timeframe.value?.start) return;
   dragState.active = false;
   dragState.chart = null;
   const base = new Date(timeframe.value.start);
   if (Number.isNaN(base.getTime())) return;
-  const startTime = new Date(base.getTime() + rangeStart.value * resolutionMinutes.value * 60_000);
-  const endTime = new Date(base.getTime() + (rangeEnd.value + 1) * resolutionMinutes.value * 60_000 - 60_000);
-  const resolutionSeconds = computeResolutionSeconds(startTime, endTime);
   const qualityMap = new Map(
     (timeframe.value?.frame_quality ?? []).map((entry) => [entry.symbol, entry.quality])
   );
-  const token = (renderToken += 1);
-
-  let payloads = [];
-  try {
-    payloads = await Promise.all(
-      symbols.value.map(async (symbol) => {
-        const result = await fetchPriceOverview(symbol, startTime, endTime, resolutionSeconds);
-        return { symbol, result };
-      })
-    );
-  } catch (err) {
-    error.value = err?.message ?? "Erro ao carregar price overview.";
-    return;
-  }
-
-  if (token !== renderToken) return;
 
   const availableSymbols = payloads
     .filter(({ result }) => result?.prices?.length)
@@ -366,6 +382,29 @@ const renderCharts = async () => {
           },
         },
         {
+          id: "compute-marker",
+          afterDatasetsDraw(chartInstance) {
+            const { ctx, chartArea, scales } = chartInstance;
+            if (!chartArea || !scales?.x) return;
+            const symbol = chartInstance.__computeSymbol;
+            if (!symbol) return;
+            const markerIndex = computeMarkers.get(symbol);
+            if (markerIndex == null) return;
+            const { top, bottom, left, right } = chartArea;
+            const x = scales.x.getPixelForValue(markerIndex);
+            if (!Number.isFinite(x) || x < left || x > right) return;
+            ctx.save();
+            ctx.strokeStyle = "rgba(255, 209, 102, 0.85)";
+            ctx.lineWidth = 2;
+            ctx.setLineDash([]);
+            ctx.beginPath();
+            ctx.moveTo(x, top);
+            ctx.lineTo(x, bottom);
+            ctx.stroke();
+            ctx.restore();
+          },
+        },
+        {
           id: "range-selection",
           beforeDatasetsDraw(chartInstance) {
             if (!dragState.active || dragState.chart !== chartInstance) return;
@@ -379,6 +418,28 @@ const renderCharts = async () => {
             ctx.save();
             ctx.fillStyle = "rgba(123, 230, 207, 0.18)";
             ctx.strokeStyle = "rgba(123, 230, 207, 0.7)";
+            ctx.lineWidth = 1;
+            ctx.fillRect(xStart, top, xEnd - xStart, bottom - top);
+            ctx.strokeRect(xStart, top, xEnd - xStart, bottom - top);
+            ctx.restore();
+          },
+        },
+        {
+          id: "selection-overlay",
+          afterDatasetsDraw(chartInstance) {
+            const { ctx, chartArea, scales } = chartInstance;
+            if (!chartArea || !scales?.x) return;
+            const symbol = chartInstance.__computeSymbol;
+            if (!symbol) return;
+            const selection = selectionRanges.get(symbol);
+            if (!selection) return;
+            const { top, bottom } = chartArea;
+            const xStart = scales.x.getPixelForValue(selection.startIdx);
+            const xEnd = scales.x.getPixelForValue(selection.endIdx + 1);
+            if (!Number.isFinite(xStart) || !Number.isFinite(xEnd)) return;
+            ctx.save();
+            ctx.fillStyle = "rgba(255, 209, 102, 0.12)";
+            ctx.strokeStyle = "rgba(255, 209, 102, 0.6)";
             ctx.lineWidth = 1;
             ctx.fillRect(xStart, top, xEnd - xStart, bottom - top);
             ctx.strokeRect(xStart, top, xEnd - xStart, bottom - top);
@@ -437,11 +498,37 @@ const renderCharts = async () => {
       bucketMs: resolutionMinutes.value * 60_000,
       maxIndex: Math.max(labels.length - 1, 0),
     };
+    chart.__computeSymbol = symbol;
     chartInstances.set(symbol, chart);
     canvas.__chartRef = chart;
     installHoverSync(canvas, chart);
     installRangeSelection(canvas, chart);
+    installComputeMarker(canvas, chart, symbol);
   });
+};
+
+const renderCharts = async () => {
+  if (!symbols.value.length) return;
+  if (!timeframe.value?.start) return;
+  const base = new Date(timeframe.value.start);
+  if (Number.isNaN(base.getTime())) return;
+  const startTime = new Date(base.getTime() + rangeStart.value * resolutionMinutes.value * 60_000);
+  const endTime = new Date(base.getTime() + (rangeEnd.value + 1) * resolutionMinutes.value * 60_000 - 60_000);
+  const resolutionSeconds = customResolutionSeconds.value > 0
+    ? customResolutionSeconds.value
+    : computeResolutionSeconds(startTime, endTime);
+  const token = (renderToken += 1);
+
+  let payloads = [];
+  try {
+    payloads = await fetchPriceOverviewBatch(symbols.value, startTime, endTime, resolutionSeconds);
+  } catch (err) {
+    error.value = err?.message ?? "Erro ao carregar price overview.";
+    return;
+  }
+
+  if (token !== renderToken) return;
+  renderChartsWithPayloads(payloads, startTime, endTime, resolutionSeconds);
 };
 
 const clearHoverSync = () => {
@@ -519,15 +606,20 @@ const finalizeRangeSelection = () => {
     startBucket = Math.floor((baseMinute + startMinute) / resolutionMinutes.value);
     endBucket = Math.floor((baseMinute + endMinute) / resolutionMinutes.value);
   }
+  const symbol = dragState.chart.__computeSymbol;
+  if (symbol) {
+    selectionRanges.set(symbol, {
+      startIdx: startMinute,
+      endIdx: endMinute,
+      startBucket,
+      endBucket,
+    });
+    lastSelectionSymbol.value = symbol;
+  }
   dragState.active = false;
+  dragState.didSelect = true;
   dragState.chart.update("none");
   dragState.chart = null;
-  rangeStart.value = startBucket;
-  rangeEnd.value = endBucket;
-  clampRange();
-  if (sliderApi.value) {
-    sliderApi.value.set([rangeStart.value, rangeEnd.value]);
-  }
   renderCharts();
 };
 
@@ -574,20 +666,294 @@ const installRangeSelection = (canvas, chart) => {
   });
 };
 
-const fetchPriceOverview = async (symbol, start, end, resolutionSeconds) => {
-  const params = new URLSearchParams({
-    start: formatDateTime(start),
-    end: formatDateTime(end),
-    resolution: String(resolutionSeconds),
+const installComputeMarker = (canvas, chart, symbol) => {
+  if (canvas.__computeMarkerInstalled) return;
+  canvas.__computeMarkerInstalled = true;
+  canvas.addEventListener("click", (event) => {
+    if (dragState.didSelect) {
+      dragState.didSelect = false;
+      return;
+    }
+    const current = canvas.__chartRef ?? chart;
+    if (!current?.canvas) return;
+    const index = getIndexFromEvent(current, event);
+    if (index == null) return;
+    computeMarkers.set(symbol, index);
+    lastSymbol.value = symbol;
+    showAiPredict.value = true;
+    saveComputeState();
+    current.update("none");
   });
-  const response = await fetch(`/market-visual-runner-bff/symbols/${encodeURIComponent(symbol)}/price-overview?${params}`);
-  if (response.status === 404) {
-    return null;
+};
+
+const buildWsUrl = () => {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${protocol}://${window.location.host}/market-visual-runner-bff/ws`;
+};
+
+const connectWebsocket = () => {
+  const existing = wsRef.value;
+  if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
+    return;
   }
-  if (!response.ok) {
-    throw new Error("Falha ao carregar price overview.");
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
   }
-  return response.json();
+  const ws = new WebSocket(buildWsUrl());
+  wsRef.value = ws;
+  wsStatus.value = "connecting";
+
+  ws.addEventListener("open", () => {
+    wsStatus.value = "open";
+    wsReconnectAttempts = 0;
+    requestState();
+  });
+
+  ws.addEventListener("close", () => {
+    wsStatus.value = "closed";
+    scheduleReconnect();
+  });
+
+  ws.addEventListener("error", () => {
+    wsStatus.value = "error";
+    scheduleReconnect();
+  });
+
+  ws.addEventListener("message", (event) => {
+    let payload;
+    try {
+      payload = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    const requestId = payload?.request_id;
+    if (!requestId || !wsRequests.has(requestId)) return;
+    const entry = wsRequests.get(requestId);
+    wsRequests.delete(requestId);
+    clearTimeout(entry.timeout);
+    if (payload?.type === "error") {
+      entry.reject(new Error(payload?.message || "Erro no WebSocket."));
+      return;
+    }
+    entry.resolve(payload);
+  });
+};
+
+const closeWebsocket = () => {
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+  wsReconnectAttempts = 0;
+  wsRequests.forEach((entry) => {
+    clearTimeout(entry.timeout);
+    entry.reject(new Error("WebSocket encerrado."));
+  });
+  wsRequests.clear();
+  if (wsRef.value) {
+    wsRef.value.close();
+  }
+  wsRef.value = null;
+};
+
+const scheduleReconnect = () => {
+  if (wsReconnectTimer) return;
+  wsReconnectAttempts += 1;
+  const delay = Math.min(30000, 1000 * 2 ** Math.min(wsReconnectAttempts, 5));
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    connectWebsocket();
+  }, delay);
+};
+
+const waitForWsOpen = () =>
+  new Promise((resolve, reject) => {
+    const ws = wsRef.value;
+    if (!ws) {
+      reject(new Error("WebSocket indisponivel."));
+      return;
+    }
+    if (ws.readyState === WebSocket.OPEN) {
+      resolve(ws);
+      return;
+    }
+    if (ws.readyState !== WebSocket.CONNECTING) {
+      reject(new Error("WebSocket indisponivel."));
+      return;
+    }
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("WebSocket indisponivel."));
+    }, 5000);
+    const cleanup = () => {
+      clearTimeout(timer);
+      ws.removeEventListener("open", handleOpen);
+      ws.removeEventListener("error", handleError);
+      ws.removeEventListener("close", handleError);
+    };
+    const handleOpen = () => {
+      cleanup();
+      resolve(ws);
+    };
+    const handleError = () => {
+      cleanup();
+      reject(new Error("WebSocket indisponivel."));
+    };
+    ws.addEventListener("open", handleOpen);
+    ws.addEventListener("error", handleError);
+    ws.addEventListener("close", handleError);
+  });
+
+const sendWsRequest = (type, payload) =>
+  new Promise(async (resolve, reject) => {
+    let ws;
+    try {
+      ws = await waitForWsOpen();
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    const requestId = `req_${Date.now()}_${wsRequestSeq++}`;
+    const timeout = setTimeout(() => {
+      wsRequests.delete(requestId);
+      reject(new Error("WebSocket timeout."));
+    }, 15000);
+    wsRequests.set(requestId, { resolve, reject, timeout });
+    ws.send(JSON.stringify({ type, request_id: requestId, ...payload }));
+  });
+
+const fetchTimeframeWS = async () => {
+  const response = await sendWsRequest("timeframe", {});
+  if (response?.data) {
+    return response.data;
+  }
+  throw new Error("Falha ao carregar timeframe.");
+};
+
+const fetchPriceOverviewBatch = async (symbolsList, start, end, resolutionSeconds) => {
+  if (!symbolsList?.length) return [];
+  const response = await sendWsRequest("price_overview_batch", {
+    symbols: symbolsList,
+    start: formatDateTimeParam(start),
+    end: formatDateTimeParam(end),
+    resolution: resolutionSeconds,
+  });
+  const items = Array.isArray(response?.data) ? response.data : [];
+  return items.map((item) => ({ symbol: item.symbol, result: item.data ?? null }));
+};
+
+const requestState = async () => {
+  try {
+    const response = await sendWsRequest("state_get", {});
+    if (response?.data) {
+      pendingState.value = response.data;
+      applyPendingState();
+    }
+  } catch {
+    // ignore
+  }
+};
+
+const applyPendingState = () => {
+  const state = pendingState.value;
+  if (!state || !timeframe.value || !minutesCount.value) return;
+  pendingState.value = null;
+  isApplyingState = true;
+  let didApplyRange = false;
+  const base = new Date(timeframe.value.start);
+  if (!Number.isNaN(base.getTime()) && state.range_start_time && state.range_end_time) {
+    const startTime = new Date(state.range_start_time);
+    const endTime = new Date(state.range_end_time);
+    if (!Number.isNaN(startTime.getTime()) && !Number.isNaN(endTime.getTime())) {
+      const bucketMs = resolutionMinutes.value * 60_000;
+      const startOffset = startTime.getTime() - base.getTime();
+      const endOffset = endTime.getTime() - base.getTime();
+      rangeStart.value = Math.max(0, Math.min(Math.floor(startOffset / bucketMs), endIndex.value));
+      rangeEnd.value = Math.max(0, Math.min(Math.floor(endOffset / bucketMs), endIndex.value));
+      didApplyRange = true;
+    }
+  } else if (typeof state.range_start === "number" && typeof state.range_end === "number") {
+    rangeStart.value = Math.max(0, Math.min(state.range_start, endIndex.value));
+    rangeEnd.value = Math.max(0, Math.min(state.range_end, endIndex.value));
+    didApplyRange = true;
+  }
+  clampRange();
+  if (sliderApi.value) {
+    sliderApi.value.set([rangeStart.value, rangeEnd.value]);
+  }
+  if (state.markers && typeof state.markers === "object") {
+    computeMarkers.clear();
+    Object.entries(state.markers).forEach(([symbol, index]) => {
+      if (Number.isFinite(index)) {
+        computeMarkers.set(symbol, index);
+      }
+    });
+    showAiPredict.value = computeMarkers.size > 0;
+  }
+  if (typeof state.resolution === "string" && state.resolution) {
+    // Keep for session display/diagnostics; timeframe resolution still drives rendering.
+  }
+  if (Number.isFinite(state.ticks_requested)) {
+    ticksRequested.value = state.ticks_requested;
+  }
+  if (typeof state.last_symbol === "string") {
+    lastSymbol.value = state.last_symbol;
+  }
+  if (Number.isFinite(state.custom_resolution_seconds)) {
+    customResolutionSeconds.value = state.custom_resolution_seconds;
+  }
+  if (sliderApi.value) {
+    sliderApi.value.enable();
+  }
+  chartInstances.forEach((chart) => chart.update("none"));
+  if (didApplyRange) {
+    restoredRange.value = true;
+  }
+  isApplyingState = false;
+};
+
+const buildComputeStatePayload = () => ({
+  range_start: rangeStart.value,
+  range_end: rangeEnd.value,
+  markers: Object.fromEntries(computeMarkers.entries()),
+  ticks_requested: ticksRequested.value,
+  last_symbol: lastSymbol.value,
+  resolution: timeframe.value?.resolution ?? "",
+  custom_resolution_seconds: customResolutionSeconds.value,
+});
+
+const saveComputeState = async () => {
+  try {
+    await sendWsRequest("state_update", { state: buildComputeStatePayload() });
+  } catch {
+    // ignore
+  }
+};
+
+const scheduleSaveComputeState = () => {
+  if (isApplyingState) return;
+  if (stateSaveTimer) clearTimeout(stateSaveTimer);
+  stateSaveTimer = setTimeout(() => {
+    stateSaveTimer = null;
+    saveComputeState();
+  }, 300);
+};
+
+const sendRangeSelectionNow = async () => {
+  if (isApplyingState) return;
+  const range = getSelectedRangeTimes();
+  if (!range) return;
+  try {
+    await sendWsRequest("range_selection", {
+      start: formatDateTimeParam(range.startTime),
+      end: formatDateTimeParam(range.endTime),
+      range_start: rangeStart.value,
+      range_end: rangeEnd.value,
+    });
+  } catch {
+    // ignore
+  }
 };
 
 const buildGapRanges = (flags, startIdx, endIdx, stepMinutes, resolutionSeconds, maxIndex) => {
@@ -636,6 +1002,119 @@ const buildGapRanges = (flags, startIdx, endIdx, stepMinutes, resolutionSeconds,
   return remapped;
 };
 
+const getSelectedRangeTimes = () => {
+  if (!timeframe.value?.start || !minutesCount.value) return null;
+  const base = new Date(timeframe.value.start);
+  if (Number.isNaN(base.getTime())) return null;
+  const startTime = new Date(base.getTime() + rangeStart.value * resolutionMinutes.value * 60_000);
+  const endTime = new Date(base.getTime() + (rangeEnd.value + 1) * resolutionMinutes.value * 60_000 - 60_000);
+  return { startTime, endTime };
+};
+
+const getSelectionRangeTimes = () => {
+  if (!timeframe.value?.start || !minutesCount.value) return null;
+  const symbol = lastSelectionSymbol.value || [...selectionRanges.keys()][0];
+  if (!symbol) return null;
+  const selection = selectionRanges.get(symbol);
+  if (!selection) return null;
+  const base = new Date(timeframe.value.start);
+  if (Number.isNaN(base.getTime())) return null;
+  const startTime = new Date(base.getTime() + selection.startBucket * resolutionMinutes.value * 60_000);
+  const endTime = new Date(base.getTime() + (selection.endBucket + 1) * resolutionMinutes.value * 60_000 - 60_000);
+  return { startTime, endTime, selection };
+};
+
+const requestMoreTicks = async () => {
+  const selectionRange = getSelectionRangeTimes();
+  const range = selectionRange ?? getSelectedRangeTimes();
+  if (!range) return;
+  loading.value = true;
+  error.value = "";
+  try {
+    connectWebsocket();
+    const response = await sendWsRequest("increase_resolution", {
+      ticks: 5000,
+      start: formatDateTimeParam(range.startTime),
+      end: formatDateTimeParam(range.endTime),
+      symbols: symbols.value,
+    });
+    const items = Array.isArray(response?.data?.items) ? response.data.items : [];
+    const resolutionSeconds =
+      typeof response?.data?.resolution_seconds === "number" && response.data.resolution_seconds > 0
+        ? response.data.resolution_seconds
+        : computeResolutionSeconds(range.startTime, range.endTime);
+    const payloads = items.map((item) => ({ symbol: item.symbol, result: item.data ?? null }));
+    customResolutionSeconds.value = resolutionSeconds;
+    renderChartsWithPayloads(payloads, range.startTime, range.endTime, resolutionSeconds);
+    ticksRequested.value += 5000;
+    await saveComputeState();
+  } catch (err) {
+    error.value = err?.message ?? "Erro ao pedir mais ticks.";
+  } finally {
+    loading.value = false;
+  }
+};
+
+const zoomToSelection = () => {
+  const selectionRange = getSelectionRangeTimes();
+  if (!selectionRange?.selection) return;
+  rangeStart.value = Math.max(0, Math.min(selectionRange.selection.startBucket, endIndex.value));
+  rangeEnd.value = Math.max(0, Math.min(selectionRange.selection.endBucket, endIndex.value));
+  clampRange();
+  if (sliderApi.value) {
+    sliderApi.value.set([rangeStart.value, rangeEnd.value]);
+  }
+  renderCharts();
+  sendRangeSelectionNow();
+};
+
+const resetSession = async () => {
+  loading.value = true;
+  error.value = "";
+  let resetState = null;
+  try {
+    connectWebsocket();
+    const response = await sendWsRequest("state_reset", {});
+    resetState = response?.data ?? null;
+  } catch (err) {
+    error.value = err?.message ?? "Erro ao resetar sessao.";
+  } finally {
+    loading.value = false;
+  }
+  if (resetState) {
+    pendingState.value = resetState;
+    applyPendingState();
+  }
+  showAiPredict.value = false;
+  computeMarkers.clear();
+  ticksRequested.value = 0;
+  lastSymbol.value = "";
+  customResolutionSeconds.value = 0;
+  selectionRanges.clear();
+  lastSelectionSymbol.value = "";
+  rangeStart.value = 0;
+  rangeEnd.value = endIndex.value;
+  clampRange();
+  if (sliderApi.value) {
+    sliderApi.value.set([rangeStart.value, rangeEnd.value]);
+    sliderApi.value.enable();
+  }
+  restoredRange.value = false;
+  pendingState.value = null;
+  if (sliderApi.value) {
+    sliderApi.value.updateOptions(
+      {
+        range: { min: 0, max: endIndex.value },
+        step: 1,
+        start: [rangeStart.value, rangeEnd.value],
+      },
+      true
+    );
+  }
+  chartInstances.forEach((chart) => chart.update("none"));
+  renderCharts();
+};
+
 </script>
 
 <style scoped>
@@ -666,6 +1145,96 @@ const buildGapRanges = (flags, startIdx, endIdx, stepMinutes, resolutionSeconds,
 
 .noui-slider {
   margin: 0.4rem 0 0.2rem;
+}
+
+.panel-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.8rem;
+}
+
+.ai-btn {
+  border: 1px solid rgba(123, 230, 207, 0.45);
+  border-radius: 999px;
+  padding: 0.7rem 1.4rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: #e7faf7;
+  background: rgba(8, 18, 19, 0.7);
+  box-shadow: 0 10px 20px rgba(4, 11, 12, 0.35);
+  cursor: pointer;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.ai-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 24px rgba(4, 11, 12, 0.45);
+  border-color: rgba(123, 230, 207, 0.75);
+}
+
+.increase-btn {
+  border: 1px solid rgba(255, 209, 102, 0.6);
+  border-radius: 999px;
+  padding: 0.7rem 1.4rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #fff1c2;
+  background: rgba(26, 20, 10, 0.7);
+  box-shadow: 0 10px 20px rgba(4, 11, 12, 0.35);
+  cursor: pointer;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.increase-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 24px rgba(4, 11, 12, 0.45);
+  border-color: rgba(255, 209, 102, 0.9);
+}
+
+.reset-btn {
+  border: 1px solid rgba(255, 122, 122, 0.6);
+  border-radius: 999px;
+  padding: 0.7rem 1.4rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #ffd6d6;
+  background: rgba(26, 10, 10, 0.7);
+  box-shadow: 0 10px 20px rgba(4, 11, 12, 0.35);
+  cursor: pointer;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.reset-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 24px rgba(4, 11, 12, 0.45);
+  border-color: rgba(255, 122, 122, 0.9);
+}
+
+.zoom-btn {
+  border: 1px solid rgba(123, 190, 255, 0.6);
+  border-radius: 999px;
+  padding: 0.7rem 1.4rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #d6ebff;
+  background: rgba(10, 16, 26, 0.7);
+  box-shadow: 0 10px 20px rgba(4, 11, 12, 0.35);
+  cursor: pointer;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.zoom-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 14px 24px rgba(4, 11, 12, 0.45);
+  border-color: rgba(123, 190, 255, 0.9);
 }
 
 :deep(.noUi-target) {

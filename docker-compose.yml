@@ -59,7 +59,7 @@ services:
       - .env
     environment:
       - MASSIVE_NEWS_LIMIT=10
-      - MASSIVE_NEWS_ORDER=asc
+      - MASSIVE_NEWS_ORDER=desc
       - MASSIVE_NEWS_SORT=published_utc
       - MASSIVE_NEWS_INTERVAL_SECONDS=${MASSIVE_NEWS_INTERVAL_SECONDS:-3600}
     volumes:
