@@ -90,6 +90,29 @@ services:
       - ./.data/cedro-ticker-uploader:/data/cedro-ticker-uploader:ro
       - ./.data/massive-ticker-uploader:/data/massive-ticker-uploader:ro
 
+  intraday-ai-predict:
+    build:
+      context: ./services/intraday-ai-predict
+    container_name: intraday-ai-predict
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      INTRADAY_AI_PREDICT_PROMPT_FILE: "/data/intraday-ai-predict/AI_README.md"
+      INTRADAY_AI_PREDICT_PROMPT: "${INTRADAY_AI_PREDICT_PROMPT:-}"
+      CODEX_API_KEY: "${OPENAI_API_KEY}"
+      INTRADAY_AI_PREDICT_MODEL: "${INTRADAY_AI_PREDICT_MODEL:-}"
+      INTRADAY_AI_PREDICT_MODE: "${INTRADAY_AI_PREDICT_MODE:-full-auto}"
+      INTRADAY_AI_PREDICT_CLEAR_ON_START: "${INTRADAY_AI_PREDICT_CLEAR_ON_START:-1}"
+      INTRADAY_AI_PREDICT_DATA_ROOT: "/data/intraday-ai-predict"
+      INTRADAY_AI_PREDICT_INTERVAL_SECONDS: "${INTRADAY_AI_PREDICT_INTERVAL_SECONDS:-3600}"
+      INTRADAY_AI_PREDICT_WORKSPACE: "/data/intraday-ai-predict/workspace"
+      INTRADAY_AI_PREDICT_OUT_FILE: "/data/intraday-ai-predict/predictions.md"
+      INTRADAY_AI_PREDICT_STOP_TOKEN: "${INTRADAY_AI_PREDICT_STOP_TOKEN:-END_SESSION}"
+    volumes:
+      - ./.data/intraday-ai-predict:/data/intraday-ai-predict
+      - ./services/intraday-ai-predict/AI_README.md:/data/intraday-ai-predict/AI_README.md:ro
+
   nginx:
     image: nginx:alpine
     container_name: nginx
